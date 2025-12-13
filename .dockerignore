@@ -4,7 +4,7 @@
 *. md
 . gitignore
 .env
-.env.*
+. env.*
 
 # Build artifacts
 *. exe
@@ -13,6 +13,8 @@
 *.so
 *.dylib
 cache-server
+*. test
+*.out
 
 # Test files
 *_test.go
@@ -20,9 +22,9 @@ testdata/
 
 # IDE
 .vscode/
-.idea/
+. idea/
 *.swp
-*.swo
+*. swo
 *~
 
 # OS
@@ -32,4 +34,5 @@ Thumbs.db
 # Temp
 tmp/
 temp/
-*. log
+*.log
+data/

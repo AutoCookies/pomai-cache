@@ -1,16 +1,25 @@
-# File: docker-compose.yml
 version: '3.8'
 
+networks:
+  pomai-net:
+    driver: bridge
+    external: true
+
 services:
-  cache:
-    build:
-      context: .
-      dockerfile: Dockerfile
+  # ============================================================
+  # CACHE SERVICE (Pull từ GitHub Container Registry)
+  # ============================================================
+
+  cache-service:
+    image: ghcr.io/autocookies/the_pomegranate/pomai-cache:latest
     container_name: pomai-cache
     restart: unless-stopped
+    networks:
+      - pomai-net
     ports:
-      - "8080:8080"
+      - "8080:8080" # Expose ra ngoài để Nginx Proxy Manager có thể trỏ vào
     environment:
+      - NODE_ENV=production
       - PORT=8080
       - CACHE_SHARDS=32
       - PER_TENANT_CAPACITY_BYTES=104857600 # 100MB per user
@@ -19,8 +28,6 @@ services:
       - TZ=Asia/Ho_Chi_Minh
     volumes:
       - cache-data:/data
-    networks:
-      - cache-network
     healthcheck:
       test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health" ]
       interval: 30s
@@ -32,11 +39,13 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 256M # Tương tự Nginx Proxy Manager
+        reservations:
+          memory: 128M
 
 volumes:
   cache-data:
     driver: local
-
-networks:
-  cache-network:
-    driver: bridge

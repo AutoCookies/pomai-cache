@@ -2,7 +2,7 @@
 FROM golang:1.21-alpine AS builder
 
 # Install build dependencies
-RUN apk add --no-cache git
+RUN apk add --no-cache git ca-certificates tzdata
 
 WORKDIR /app
 
@@ -11,22 +11,27 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # Copy source code
-COPY . . 
+COPY . .
 
 # Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o cache-server ./cmd/cache-server
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -a -installsuffix cgo \
+    -ldflags="-s -w" \
+    -o cache-server \
+    ./cmd/cache-server
 
 # Final stage
 FROM alpine:latest
 
-RUN apk --no-cache add ca-certificates tzdata
+# Install runtime dependencies
+RUN apk --no-cache add ca-certificates tzdata wget
 
 WORKDIR /root/
 
-# Copy the binary from builder
+# Copy binary from builder
 COPY --from=builder /app/cache-server .
 
-# Create data directory for snapshots
+# Create data directory for cache storage
 RUN mkdir -p /data
 
 # Expose port
