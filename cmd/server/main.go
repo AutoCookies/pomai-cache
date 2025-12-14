@@ -39,7 +39,7 @@ func main() {
 
 		// Bloom filter config
 		enableBloom = getEnv("ENABLE_BLOOM_FILTER", "true")
-		bloomSize   = getEnv("BLOOM_SIZE", "10000000") // 10M bits (~1. 2MB)
+		bloomSize   = getEnv("BLOOM_SIZE", "10000000") // 10M bits (~1.2MB)
 		bloomK      = getEnv("BLOOM_K", "4")           // 4 hash functions
 
 		// Persistence config
@@ -61,11 +61,8 @@ func main() {
 	)
 	flag.Parse()
 
-	log.Println("=== Pomegranate Cache Server ===")
-	log.Printf("Version: 1.0.0")
-	log.Printf("Server: %s", *addrFlag)
-	log.Printf("Per-user capacity: %dMB", *perTenantFlag/(1024*1024))
-	log.Printf("Shard count: %d", *shardsFlag)
+	// Keep only minimal startup log; no behavior change
+	log.Printf("Pomegranate Cache Server starting on %s", *addrFlag)
 
 	// ============================================================
 	// Initialize Tenant Manager & Default Store
@@ -90,9 +87,6 @@ func main() {
 		}
 
 		defaultStore.EnableAdaptiveTTL(minDuration, maxDuration)
-		log.Printf("[ADAPTIVE TTL] Enabled:  min=%v, max=%v", minDuration, maxDuration)
-	} else {
-		log.Println("[ADAPTIVE TTL] Disabled")
 	}
 
 	// ============================================================
@@ -101,7 +95,7 @@ func main() {
 	if enableBloom == "true" {
 		size, err := strconv.ParseUint(bloomSize, 10, 64)
 		if err != nil {
-			log.Fatalf("Invalid BLOOM_SIZE:  %v", err)
+			log.Fatalf("Invalid BLOOM_SIZE: %v", err)
 		}
 		k, err := strconv.ParseUint(bloomK, 10, 64)
 		if err != nil {
@@ -109,10 +103,6 @@ func main() {
 		}
 
 		defaultStore.EnableBloomFilter(size, k)
-		log.Printf("[BLOOM FILTER] Enabled: size=%d bits (~%. 2fMB), k=%d hash functions",
-			size, float64(size)/8/1024/1024, k)
-	} else {
-		log.Println("[BLOOM FILTER] Disabled")
 	}
 
 	// ============================================================
@@ -141,11 +131,11 @@ func main() {
 			}
 			fp.StartPeriodicSnapshot(defaultStore, interval)
 			log.Printf("[PERSISTENCE] File persister enabled:  interval=%v, path=%s",
-				interval, filepath.Join(dataDir, "cache", "snapshot. gob"))
+				interval, filepath.Join(dataDir, "cache", "snapshot.gob"))
 		}
 
 	case "wal":
-		persister, err = persistence.NewWALPersister(filepath.Join(dataDir, "wal. log"))
+		persister, err = persistence.NewWALPersister(filepath.Join(dataDir, "wal.log"))
 		if err != nil {
 			log.Fatalf("[PERSISTENCE] Failed to create WAL persister: %v", err)
 		}

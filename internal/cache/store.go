@@ -8,7 +8,6 @@ import (
 	"errors"
 	"hash/fnv"
 	"io"
-	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -99,8 +98,6 @@ func NewStoreWithOptions(shardCount int, capacityBytes int64) *Store {
 // k: number of hash functions (3-5 is typical, 4 is optimal for ~1% false positive rate)
 func (s *Store) EnableBloomFilter(size uint64, k uint64) {
 	s.bloom = NewBloomFilter(size, k)
-	log.Printf("[BLOOM FILTER] Enabled:  size=%d bits (~%. 2fMB), k=%d hash functions",
-		size, float64(size)/8/1024/1024, k)
 
 	// Populate bloom filter with existing keys
 	populated := 0
@@ -113,15 +110,12 @@ func (s *Store) EnableBloomFilter(size uint64, k uint64) {
 		sh.mu.RUnlock()
 	}
 
-	if populated > 0 {
-		log.Printf("[BLOOM FILTER] Populated with %d existing keys", populated)
-	}
+	_ = populated
 }
 
 // ✅ DisableBloomFilter disables bloom filter
 func (s *Store) DisableBloomFilter() {
 	s.bloom = nil
-	log.Println("[BLOOM FILTER] Disabled")
 }
 
 // ✅ GetBloomStats returns bloom filter statistics
@@ -146,12 +140,10 @@ func (s *Store) GetBloomStats() BloomStats {
 
 func (s *Store) EnableAdaptiveTTL(minTTL, maxTTL time.Duration) {
 	s.adaptiveTTL = NewAdaptiveTTL(minTTL, maxTTL)
-	log.Printf("[ADAPTIVE TTL] Enabled: min=%v, max=%v", minTTL, maxTTL)
 }
 
 func (s *Store) DisableAdaptiveTTL() {
 	s.adaptiveTTL = nil
-	log.Println("[ADAPTIVE TTL] Disabled")
 }
 
 func (s *Store) SetFreqBoost(nanoseconds int64) {
@@ -434,7 +426,7 @@ func (s *Store) RebuildBloomFilter() int {
 	atomic.StoreUint64(&s.bloomStats.Misses, 0)
 	atomic.StoreUint64(&s.bloomStats.Avoided, 0)
 
-	log.Printf("[BLOOM FILTER] Rebuilt with %d keys", count)
+	_ = count
 	return count
 }
 
@@ -764,9 +756,7 @@ func (s *Store) cleanupExpired() {
 	}
 
 	if cleaned > 0 {
-		log.Printf("[CLEANUP] Removed %d expired keys across all users", cleaned)
-
-		// ✅ Rebuild bloom filter after cleanup if many keys were removed
+		// Rebuild bloom filter after cleanup if many keys were removed
 		if s.bloom != nil && cleaned > 1000 {
 			s.RebuildBloomFilter()
 		}

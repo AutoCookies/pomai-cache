@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -142,8 +141,6 @@ func (s *Server) handlePut() http.HandlerFunc {
 		store := s.tenants.GetStore(tenant)
 		store.Put(key, body, ttl)
 
-		log.Printf("[PUT] User=%s, Key=%s, Size=%d bytes, TTL=%s", tenant, key, len(body), ttl)
-
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	}
@@ -160,11 +157,9 @@ func (s *Server) handleGet() http.HandlerFunc {
 		store := s.tenants.GetStore(tenant)
 		v, ok := store.Get(key)
 		if !ok {
-			log.Printf("[GET] Tenant=%s, Key=%s. Result: MISS (404)", tenant, key)
 			http.NotFound(w, r)
 			return
 		}
-		log.Printf("[GET] Tenant=%s, Key=%s. Result: HIT (200), Size=%d bytes", tenant, key, len(v))
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(v)
 	}
@@ -180,8 +175,6 @@ func (s *Server) handleDelete() http.HandlerFunc {
 		}
 		store := s.tenants.GetStore(tenant)
 		store.Delete(key)
-
-		log.Printf("[DELETE] Tenant=%s, Key=%s deleted.", tenant, key)
 
 		w.WriteHeader(http.StatusNoContent)
 	}
