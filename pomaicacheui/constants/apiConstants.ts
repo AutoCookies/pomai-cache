@@ -1,0 +1,3 @@
+export const ENVARS = {
+    NEXT_PUBLIC_SERVER_URL: "NEXT_PUBLIC_SERVER_URL",
+}
