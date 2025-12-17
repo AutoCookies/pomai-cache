@@ -1,4 +1,3 @@
-// File: cmd/cache-server/main.go
 package main
 
 import (
@@ -13,44 +12,68 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/AutoCookies/pomai-cache/internal/api"
-	"github.com/AutoCookies/pomai-cache/internal/cache"
-	"github.com/AutoCookies/pomai-cache/internal/persistence"
+	"github.com/joho/godotenv"
+
+	// [Adapter Imports]
+	httpadapter "github.com/AutoCookies/pomai-cache/internal/adapter/httpadapter"
+	"github.com/AutoCookies/pomai-cache/internal/adapter/persistence"
+
+	// Import Firebase
+	firebase_setup "github.com/AutoCookies/pomai-cache/internal/adapter/firebase"
+
+	// Import Auth Adapters (Đảm bảo bạn đã tạo các package này từ các bước trước)
+	"github.com/AutoCookies/pomai-cache/internal/adapter/email"
+	"github.com/AutoCookies/pomai-cache/internal/adapter/token"
+
+	// [Core Imports]
+	"github.com/AutoCookies/pomai-cache/internal/core/ports"
+	"github.com/AutoCookies/pomai-cache/internal/core/services"
+	"github.com/AutoCookies/pomai-cache/internal/engine"
 )
 
 func main() {
 	// ============================================================
-	// Configuration
+	// 0. Load Environment Variables
+	// ============================================================
+	// Cố gắng load file .env. Nếu không thấy (ví dụ chạy trên Docker/Prod đã có env thật) thì bỏ qua lỗi.
+	// Hàm này sẽ tìm file .env ở thư mục hiện tại chạy lệnh terminal.
+	if err := godotenv.Load(); err != nil {
+		log.Println("⚠️  No .env file found or failed to load, relying on system env vars")
+	} else {
+		log.Println("✅  Loaded environment variables from .env")
+	}
+	// ============================================================
+	// 1. Configuration
 	// ============================================================
 	var (
-		// Server config
 		portEnv     = getEnv("PORT", "8080")
 		shardsEnv   = getEnv("CACHE_SHARDS", "32")
 		gracefulSec = getEnv("GRACEFUL_SHUTDOWN_SEC", "10")
 
-		// Cache config
-		perTenantCapacity = getEnv("PER_TENANT_CAPACITY_BYTES", "104857600") // 100MB
-		cleanupSec        = getEnv("CLEANUP_INTERVAL_SEC", "60")             // 1 minute
+		// Cache Config
+		perTenantCapacity = getEnv("PER_TENANT_CAPACITY_BYTES", "104857600")
+		cleanupSec        = getEnv("CLEANUP_INTERVAL_SEC", "60")
 
-		// Adaptive TTL config
+		// TTL & Bloom
 		enableAdaptiveTTL = getEnv("ENABLE_ADAPTIVE_TTL", "true")
 		adaptiveMinTTL    = getEnv("ADAPTIVE_MIN_TTL", "1m")
 		adaptiveMaxTTL    = getEnv("ADAPTIVE_MAX_TTL", "1h")
+		enableBloom       = getEnv("ENABLE_BLOOM_FILTER", "true")
+		bloomSize         = getEnv("BLOOM_SIZE", "10000000")
+		bloomK            = getEnv("BLOOM_K", "4")
 
-		// Bloom filter config
-		enableBloom = getEnv("ENABLE_BLOOM_FILTER", "true")
-		bloomSize   = getEnv("BLOOM_SIZE", "10000000") // 10M bits (~1.2MB)
-		bloomK      = getEnv("BLOOM_K", "4")           // 4 hash functions
-
-		// Persistence config
-		persistenceType  = getEnv("PERSISTENCE_TYPE", "file") // "file", "wal", "noop"
-		dataDir          = getEnv("DATA_DIR", "./data")
-		snapshotInterval = getEnv("SNAPSHOT_INTERVAL", "5m")
-
-		// Write-behind config
+		// Persistence
+		persistenceType   = getEnv("PERSISTENCE_TYPE", "file")
+		dataDir           = getEnv("DATA_DIR", "./data")
+		snapshotInterval  = getEnv("SNAPSHOT_INTERVAL", "5m")
 		enableWriteBehind = getEnv("ENABLE_WRITE_BEHIND", "false")
 		writeBufferSize   = getEnv("WRITE_BUFFER_SIZE", "1000")
 		flushInterval     = getEnv("FLUSH_INTERVAL", "5s")
+
+		// Auth Config
+		tokenSecret  = getEnv("TOKEN_SECRET", "12345678901234567890123456789012") // 32 chars min
+		resendAPIKey = os.Getenv("RESEND_API_KEY")
+		resendFrom   = getEnv("RESEND_FROM_EMAIL", "Cookiescooker <no-reply@cookiescooker.click>")
 
 		// Flags
 		addrFlag      = flag.String("addr", ":"+portEnv, "listen address")
@@ -59,176 +82,119 @@ func main() {
 		gracefulFlag  = flag.Int("graceful", atoiDefault(gracefulSec, 10), "graceful shutdown seconds")
 		cleanupFlag   = flag.Int("cleanup", atoiDefault(cleanupSec, 60), "cleanup interval seconds")
 	)
+
 	flag.Parse()
 
-	// Keep only minimal startup log; no behavior change
-	log.Printf("Pomegranate Cache Server starting on %s", *addrFlag)
+	log.Printf("🚀 Pomegranate Server starting on %s", *addrFlag)
 
-	// ============================================================
-	// Initialize Tenant Manager & Default Store
-	// ============================================================
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	tenants := cache.NewTenantManager(*shardsFlag, *perTenantFlag)
+	// ============================================================
+	// 2. Initialize Infrastructure (Firebase)
+	// ============================================================
+	log.Println("[INIT] Connecting to Firebase...")
+	firebase_setup.Initialize()
+	firestoreClient := firebase_setup.GetDB()
+
+	// ============================================================
+	// 3. Initialize Cache Engine
+	// ============================================================
+	log.Println("[INIT] Starting Cache Engine...")
+	tenants := engine.NewTenantManager(*shardsFlag, *perTenantFlag)
 	defaultStore := tenants.GetStore("default")
 
-	// ============================================================
-	// Feature 1: Adaptive TTL
-	// ============================================================
 	if enableAdaptiveTTL == "true" {
-		minDuration, err := time.ParseDuration(adaptiveMinTTL)
-		if err != nil {
-			log.Fatalf("Invalid ADAPTIVE_MIN_TTL: %v", err)
-		}
-		maxDuration, err := time.ParseDuration(adaptiveMaxTTL)
-		if err != nil {
-			log.Fatalf("Invalid ADAPTIVE_MAX_TTL: %v", err)
-		}
-
-		defaultStore.EnableAdaptiveTTL(minDuration, maxDuration)
+		min, _ := time.ParseDuration(adaptiveMinTTL)
+		max, _ := time.ParseDuration(adaptiveMaxTTL)
+		defaultStore.EnableAdaptiveTTL(min, max)
 	}
-
-	// ============================================================
-	// Feature 2: Bloom Filter
-	// ============================================================
 	if enableBloom == "true" {
-		size, err := strconv.ParseUint(bloomSize, 10, 64)
-		if err != nil {
-			log.Fatalf("Invalid BLOOM_SIZE: %v", err)
-		}
-		k, err := strconv.ParseUint(bloomK, 10, 64)
-		if err != nil {
-			log.Fatalf("Invalid BLOOM_K: %v", err)
-		}
-
+		size, _ := strconv.ParseUint(bloomSize, 10, 64)
+		k, _ := strconv.ParseUint(bloomK, 10, 64)
 		defaultStore.EnableBloomFilter(size, k)
 	}
 
 	// ============================================================
-	// Feature 3: Persistence
+	// 4. Initialize Persistence (Cache Layer)
 	// ============================================================
-	var persister persistence.Persister
+	var persister ports.Persister
 	var err error
 
 	switch persistenceType {
 	case "file":
 		persister, err = persistence.NewFilePersister(filepath.Join(dataDir, "cache"))
 		if err != nil {
-			log.Fatalf("[PERSISTENCE] Failed to create file persister: %v", err)
+			log.Fatalf("Failed to create file persister: %v", err)
 		}
-
-		// Restore from snapshot
-		if err := persister.Restore(defaultStore); err != nil {
-			log.Printf("[PERSISTENCE] Warning:  Restore failed: %v", err)
-		}
-
-		// Start periodic snapshots
 		if fp, ok := persister.(*persistence.FilePersister); ok {
-			interval, err := time.ParseDuration(snapshotInterval)
-			if err != nil {
-				log.Fatalf("[PERSISTENCE] Invalid SNAPSHOT_INTERVAL: %v", err)
-			}
+			_ = fp.Restore(defaultStore)
+			interval, _ := time.ParseDuration(snapshotInterval)
 			fp.StartPeriodicSnapshot(defaultStore, interval)
-			log.Printf("[PERSISTENCE] File persister enabled:  interval=%v, path=%s",
-				interval, filepath.Join(dataDir, "cache", "snapshot.gob"))
 		}
-
 	case "wal":
 		persister, err = persistence.NewWALPersister(filepath.Join(dataDir, "wal.log"))
 		if err != nil {
-			log.Fatalf("[PERSISTENCE] Failed to create WAL persister: %v", err)
+			log.Fatalf("Failed to create WAL persister: %v", err)
 		}
-
-		// Restore from WAL + snapshot
-		if err := persister.Restore(defaultStore); err != nil {
-			log.Printf("[PERSISTENCE] Warning: WAL restore failed: %v", err)
+		if wp, ok := persister.(*persistence.WALPersister); ok {
+			_ = wp.Restore(defaultStore)
 		}
-
-		log.Printf("[PERSISTENCE] WAL persister enabled:  path=%s", filepath.Join(dataDir, "wal.log"))
-
 	default:
 		persister = persistence.NewNoOpPersister()
-		log.Println("[PERSISTENCE] Disabled (using noop)")
 	}
-
-	defer func() {
-		if persistenceType != "noop" {
-			log.Println("[PERSISTENCE] Creating final snapshot...")
-			if err := persister.Snapshot(defaultStore); err != nil {
-				log.Printf("[PERSISTENCE] Warning: Final snapshot failed: %v", err)
-			} else {
-				log.Println("[PERSISTENCE] Final snapshot completed")
-			}
-		}
-		persister.Close()
-	}()
-
-	// ============================================================
-	// Feature 4: Write-Behind Buffer
-	// ============================================================
-	var writeBehind *persistence.WriteBehindBuffer
 
 	if enableWriteBehind == "true" && persistenceType != "noop" {
-		bufferSize, err := strconv.Atoi(writeBufferSize)
-		if err != nil {
-			log.Fatalf("[WRITE-BEHIND] Invalid WRITE_BUFFER_SIZE: %v", err)
-		}
-		interval, err := time.ParseDuration(flushInterval)
-		if err != nil {
-			log.Fatalf("[WRITE-BEHIND] Invalid FLUSH_INTERVAL: %v", err)
-		}
-
-		writeBehind = persistence.NewWriteBehindBuffer(bufferSize, interval, persister)
-		writeBehind.Start(ctx)
-
-		defer writeBehind.Close()
-
-		log.Printf("[WRITE-BEHIND] Enabled: bufferSize=%d, interval=%v", bufferSize, interval)
+		bs, _ := strconv.Atoi(writeBufferSize)
+		fi, _ := time.ParseDuration(flushInterval)
+		wb := persistence.NewWriteBehindBuffer(bs, fi, persister)
+		wb.Start(ctx)
+		defer wb.Close()
 	} else {
-		log.Println("[WRITE-BEHIND] Disabled")
+		defer persister.Close()
 	}
 
 	// ============================================================
-	// Feature 5: Background Cleanup
+	// 5. Initialize Auth Stack (Wiring)
 	// ============================================================
-	go func() {
-		ticker := time.NewTicker(time.Duration(*cleanupFlag) * time.Second)
-		defer ticker.Stop()
+	log.Println("[INIT] Setting up Auth Stack...")
 
-		log.Printf("[CLEANUP] Started:  interval=%ds", *cleanupFlag)
+	// 5.1 Repositories
+	authRepo := persistence.NewFirestoreAuthRepo(firestoreClient)
+	verifyRepo := persistence.NewFirestoreVerificationRepo(firestoreClient)
 
-		for {
-			select {
-			case <-ctx.Done():
-				log.Println("[CLEANUP] Stopped")
-				return
-			case <-ticker.C:
-				userIDs := tenants.ListTenants()
-				totalCleaned := 0
+	// 5.2 Token Maker
+	tokenMaker, err := token.NewJWTMaker(tokenSecret)
+	if err != nil {
+		log.Fatalf("Failed to create token maker: %v", err)
+	}
 
-				for _, userID := range userIDs {
-					store := tenants.GetStore(userID)
-					cleaned := store.CleanupExpired()
-					totalCleaned += cleaned
-				}
-
-				if totalCleaned > 0 {
-					log.Printf("[CLEANUP] Removed %d expired keys across %d users", totalCleaned, len(userIDs))
-				}
-
-				// Rebuild bloom filter periodically if many keys were removed
-				if enableBloom == "true" && totalCleaned > 1000 {
-					defaultStore.RebuildBloomFilter()
-				}
-			}
+	// 5.3 Email Sender
+	var emailSender ports.EmailSender
+	if resendAPIKey == "" {
+		log.Println("⚠️ RESEND_API_KEY missing. Email sending will fail/mock.")
+		// Fallback to mock/dummy adapter if needed
+		emailSender, _ = email.NewResendAdapter("mock_key", resendFrom)
+	} else {
+		emailSender, err = email.NewResendAdapter(resendAPIKey, resendFrom)
+		if err != nil {
+			log.Fatalf("Failed to create email adapter: %v", err)
 		}
-	}()
+	}
+
+	// 5.4 Service
+	authService := services.NewAuthService(authRepo, verifyRepo, tokenMaker, emailSender)
+
+	// 5.5 Handler
+	authHandler := httpadapter.NewAuthHandler(authService)
 
 	// ============================================================
-	// HTTP Server
+	// 6. Initialize HTTP Server
 	// ============================================================
-	srv := api.NewServer(tenants, true) // true = require X-User-Id header
+	requireAuth := os.Getenv("REQUIRE_AUTH") == "true"
+
+	// [QUAN TRỌNG] Truyền authHandler vào NewServer
+	srv := httpadapter.NewServer(tenants, authHandler, tokenMaker, requireAuth)
 
 	httpSrv := &http.Server{
 		Addr:         *addrFlag,
@@ -238,75 +204,48 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// Start server in goroutine
 	go func() {
-		log.Println("=================================")
-		log.Printf("🚀 Server listening on %s", *addrFlag)
-		log.Println("=================================")
-
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[SERVER] ListenAndServe error: %v", err)
+			log.Fatalf("Listen error: %v", err)
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(time.Duration(*cleanupFlag) * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Duyệt qua tất cả tenant và xóa các key hết hạn
+				for _, uid := range tenants.ListTenants() {
+					tenants.GetStore(uid).CleanupExpired()
+				}
+			}
 		}
 	}()
 
 	// ============================================================
-	// Graceful Shutdown
+	// 7. Graceful Shutdown
 	// ============================================================
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-quit
+	<-quit
 
-	log.Printf("Received signal:  %v", sig)
-	log.Println("=================================")
-	log.Println("Shutting down gracefully...")
-	log.Println("=================================")
+	log.Println("Shutting down...")
 
-	// Stop background tasks
-	cancel()
-
-	// Shutdown HTTP server
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Duration(*gracefulFlag)*time.Second)
 	defer shutdownCancel()
 
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("[SERVER] Shutdown error:  %v", err)
-	} else {
-		log.Println("[SERVER] Stopped gracefully")
+		log.Printf("Shutdown error: %v", err)
 	}
 
-	// Print final stats
-	stats := defaultStore.Stats()
-	log.Println("=================================")
-	log.Println("Final Statistics:")
-	log.Printf("  Total Hits:       %d", stats.Hits)
-	log.Printf("  Total Misses:    %d", stats.Misses)
-	log.Printf("  Hit Rate:        %.2f%%", float64(stats.Hits)/float64(stats.Hits+stats.Misses)*100)
-	log.Printf("  Items:            %d", stats.Items)
-	log.Printf("  Bytes:           %d (%.2fMB)", stats.Bytes, float64(stats.Bytes)/1024/1024)
-	log.Printf("  Evictions:       %d", stats.Evictions)
-
-	if stats.BloomEnabled {
-		bloomStats := defaultStore.GetBloomStats()
-		log.Printf("  Bloom Avoided:   %d lookups", bloomStats.Avoided)
-		log.Printf("  Bloom FP Rate:   %.2f%%", bloomStats.FalsePositiveRate)
-	}
-
-	if writeBehind != nil {
-		wbStats := writeBehind.Stats()
-		log.Printf("  Write-Behind:")
-		log.Printf("    Total Writes:   %d", wbStats.TotalWrites)
-		log.Printf("    Total Flushes: %d", wbStats.TotalFlushes)
-		log.Printf("    Failed:         %d", wbStats.FailedFlushes)
-	}
-
-	log.Println("=================================")
-	log.Println("👋 Goodbye!")
+	log.Println("Bye!")
 }
 
-// ============================================================
 // Helper Functions
-// ============================================================
-
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value

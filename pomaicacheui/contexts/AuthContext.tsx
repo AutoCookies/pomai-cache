@@ -1,7 +1,7 @@
 "use client";
 
 import React, { createContext, useContext, useEffect, useReducer, useCallback } from "react";
-import * as authAPI from "@/helpers/authHandlers"; // adjust path if necessary
+import * as authAPI from "@/services/authHandlers"; // adjust path if necessary
 import { authReducer, initialAuthState, AuthState } from "@/reducers/authReducers"; // adjust path
 
 type AuthContextValue = {
