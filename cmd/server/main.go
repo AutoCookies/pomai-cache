@@ -38,9 +38,9 @@ func main() {
 	// Cố gắng load file .env. Nếu không thấy (ví dụ chạy trên Docker/Prod đã có env thật) thì bỏ qua lỗi.
 	// Hàm này sẽ tìm file .env ở thư mục hiện tại chạy lệnh terminal.
 	if err := godotenv.Load(); err != nil {
-		log.Println("⚠️  No .env file found or failed to load, relying on system env vars")
+		log.Println("No .env file found or failed to load, relying on system env vars")
 	} else {
-		log.Println("✅  Loaded environment variables from .env")
+		log.Println("Loaded environment variables from .env")
 	}
 	// ============================================================
 	// 1. Configuration
@@ -71,7 +71,7 @@ func main() {
 		flushInterval     = getEnv("FLUSH_INTERVAL", "5s")
 
 		// Auth Config
-		tokenSecret  = getEnv("TOKEN_SECRET", "12345678901234567890123456789012") // 32 chars min
+		tokenSecret  = getEnv("JWT_ACCESS_SECRET", "12345678901234567890123456789012") // 32 chars min
 		resendAPIKey = os.Getenv("RESEND_API_KEY")
 		resendFrom   = getEnv("RESEND_FROM_EMAIL", "Cookiescooker <no-reply@cookiescooker.click>")
 
@@ -196,9 +196,11 @@ func main() {
 	// [QUAN TRỌNG] Truyền authHandler vào NewServer
 	srv := httpadapter.NewServer(tenants, authHandler, tokenMaker, requireAuth)
 
+	handlerWithCors := httpadapter.CorsMiddleware(srv.Router())
+
 	httpSrv := &http.Server{
 		Addr:         *addrFlag,
-		Handler:      srv.Router(),
+		Handler:      handlerWithCors,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,

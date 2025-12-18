@@ -4,6 +4,7 @@ import {
   Zap, Server, Shield, Activity, ArrowRight,
   Terminal, Check, Cpu, Globe, Lock
 } from "lucide-react";
+import Link from "next/link";
 
 // --- ASSETS ---
 // Bạn hãy import đường dẫn ảnh logo thực tế của bạn vào đây
@@ -23,7 +24,6 @@ const PomaiCacheLanding = () => {
   return (
     <div className="min-h-screen bg-[#F9F7F2] font-sans text-slate-800 selection:bg-[#4B8B8B] selection:text-white">
 
-      {/* --- NAVBAR --- */}
       <nav className={`fixed top-0 inset-x-0 z-50 transition-all duration-300 ${scrolled ? "bg-white/90 backdrop-blur-md shadow-sm py-3" : "bg-transparent py-5"}`}>
         <div className="max-w-7xl mx-auto px-6 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -36,7 +36,7 @@ const PomaiCacheLanding = () => {
             <a href="#docs" className="hover:text-[#4B8B8B] transition-colors">Documentation</a>
           </div>
           <div className="flex items-center gap-4">
-            <a href="/login" className="hidden md:block text-sm font-bold text-slate-700 hover:text-[#4B8B8B]">Sign In</a>
+            <Link href="/signin" className="hidden md:block text-sm font-bold text-slate-700 hover:text-[#4B8B8B]">Sign In</Link>
             <button className="bg-[#4B8B8B] text-white px-5 py-2.5 rounded-lg text-sm font-bold shadow-lg shadow-[#4B8B8B]/20 hover:bg-[#3a6f6f] hover:-translate-y-0.5 transition-all">
               Get API Key
             </button>
@@ -44,11 +44,8 @@ const PomaiCacheLanding = () => {
         </div>
       </nav>
 
-      {/* --- HERO SECTION --- */}
       <section className="relative pt-32 pb-20 lg:pt-48 lg:pb-32 overflow-hidden">
         <div className="max-w-7xl mx-auto px-6 grid lg:grid-cols-2 gap-16 items-center">
-
-          {/* Left Content */}
           <div className="relative z-10 animate-in fade-in slide-in-from-bottom-8 duration-700">
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[#4B8B8B]/10 text-[#4B8B8B] text-xs font-bold uppercase tracking-widest mb-6 border border-[#4B8B8B]/20">
               <Zap size={14} /> v1.0 Stable Release
@@ -214,9 +211,7 @@ const PomaiCacheLanding = () => {
         </div>
       </section>
 
-      {/* --- CTA SECTION --- */}
       <section className="py-20 bg-[#1e293b] text-white overflow-hidden relative">
-        {/* Background Decor */}
         <div className="absolute top-0 right-0 w-96 h-96 bg-[#4B8B8B] rounded-full blur-[128px] opacity-20"></div>
 
         <div className="max-w-4xl mx-auto px-6 text-center relative z-10">
@@ -237,7 +232,6 @@ const PomaiCacheLanding = () => {
         </div>
       </section>
 
-      {/* --- FOOTER --- */}
       <footer className="bg-white py-12 border-t border-gray-200">
         <div className="max-w-7xl mx-auto px-6 flex flex-col md:flex-row justify-between items-center gap-6">
           <div className="flex items-center gap-2">

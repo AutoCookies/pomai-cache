@@ -1,123 +1,129 @@
-"use client";
+// lib/auth/AuthContext.tsx
+import React, { createContext, useEffect, useReducer, ReactNode } from 'react';
+import { authReducer, initialState } from "@/reducers/authReducers"; // Đảm bảo đường dẫn đúng
+import { AuthState, User } from '@/lib/auth/types'; // Đảm bảo đường dẫn đúng
+import authService from '@/services/authServices';
 
-import React, { createContext, useContext, useEffect, useReducer, useCallback } from "react";
-import * as authAPI from "@/services/authHandlers"; // adjust path if necessary
-import { authReducer, initialAuthState, AuthState } from "@/reducers/authReducers"; // adjust path
+// ... (Interface AuthContextType giữ nguyên) ...
+interface AuthContextType extends AuthState {
+    login: (params: any) => Promise<void>;
+    register: (params: any) => Promise<void>;
+    verify: (params: any) => Promise<void>;
+    logout: () => Promise<void>;
+    resend: (email: string) => Promise<void>;
+    refreshProfile: () => Promise<void>;
+    clearError: () => void;
+}
 
-type AuthContextValue = {
-    state: AuthState;
-    signin: (email: string, password: string) => Promise<any>;
-    signout: () => Promise<void>;
-    refresh: () => Promise<any>;
-    reload: () => Promise<any>;
-};
+export const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-const AuthContext = createContext<AuthContextValue | undefined>(undefined);
+export const AuthProvider = ({ children }: { children: ReactNode }) => {
+    const [state, dispatch] = useReducer(authReducer, initialState);
 
-export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-    const [state, dispatch] = useReducer(authReducer, initialAuthState);
-
-    const initialize = useCallback(async () => {
-        dispatch({ type: "INIT_START" });
-        try {
-            try {
-                const res = await authAPI.me();
-                const user = res.user ?? res.claims ?? res;
-                dispatch({ type: "SET_USER", payload: user });
-            } catch (meErr: any) {
-                if (meErr?.status === 401) {
-                    try {
-                        await authAPI.refresh();
-                        const res2 = await authAPI.me();
-                        const user = res2.user ?? res2.claims ?? res2;
-                        dispatch({ type: "SET_USER", payload: user });
-                    } catch {
-                        dispatch({ type: "CLEAR_USER" });
-                    }
-                } else {
-                    dispatch({ type: "CLEAR_USER" });
-                    dispatch({ type: "SET_ERROR", payload: meErr?.message ?? String(meErr) });
-                }
-            }
-        } finally {
-            dispatch({ type: "INIT_DONE" });
-        }
-    }, []);
-
+    // 1. Check Login status on Mount
     useEffect(() => {
-        initialize();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
-
-    const signin = useCallback(async (email: string, password: string) => {
-        dispatch({ type: "SET_LOADING", payload: true });
-        try {
-            const res = await authAPI.signin(email, password);
-            const user = res.user ?? res.claims ?? res;
-            dispatch({ type: "SET_USER", payload: user });
-            return user;
-        } catch (err: any) {
-            dispatch({ type: "SET_ERROR", payload: err?.message ?? String(err) });
-            throw err;
-        }
-    }, []);
-
-    const signout = useCallback(async () => {
-        dispatch({ type: "SET_LOADING", payload: true });
-        try {
-            await authAPI.signout();
-        } catch (err) {
-            console.warn("signout error", err);
-        } finally {
-            dispatch({ type: "CLEAR_USER" });
-        }
-    }, []);
-
-    const refresh = useCallback(async () => {
-        dispatch({ type: "SET_LOADING", payload: true });
-        try {
-            await authAPI.refresh();
+        const initAuth = async () => {
             try {
-                const meRes = await authAPI.me();
-                const user = meRes.user ?? meRes.claims ?? meRes;
-                dispatch({ type: "SET_USER", payload: user });
-                return user;
-            } catch {
-                dispatch({ type: "CLEAR_USER" });
-                return null;
+                // response bây giờ chính là User object (nhờ TypeScript cast ở service)
+                const user = await authService.me();
+
+                dispatch({
+                    type: 'INITIALIZE',
+                    payload: { user },
+                });
+            } catch (error) {
+                dispatch({
+                    type: 'INITIALIZE',
+                    payload: { user: null },
+                });
             }
-        } catch (err: any) {
-            dispatch({ type: "SET_ERROR", payload: err?.message ?? String(err) });
-            dispatch({ type: "CLEAR_USER" });
-            throw err;
-        }
+        };
+
+        initAuth();
     }, []);
 
-    const reload = useCallback(async () => {
+    // 2. Actions
+    const login = async (params: any) => {
+        dispatch({ type: 'LOGIN_START' });
         try {
-            const res = await authAPI.me();
-            const user = res.user ?? res.claims ?? res;
-            dispatch({ type: "SET_USER", payload: user });
-            return user;
-        } catch (err) {
-            dispatch({ type: "CLEAR_USER" });
-            throw err;
+            const res = await authService.signin(params);
+            // res là AuthResponse { user, accessToken... }
+            dispatch({ type: 'LOGIN_SUCCESS', payload: { user: res.user } });
+        } catch (error: any) {
+            const msg = error.message || 'Login failed';
+            dispatch({ type: 'LOGIN_FAILURE', payload: { error: msg } });
+            throw error;
         }
-    }, []);
-
-    const value: AuthContextValue = {
-        state,
-        signin,
-        signout,
-        refresh,
-        reload
     };
 
-    return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
-};
+    const register = async (params: any) => {
+        dispatch({ type: 'LOGIN_START' });
+        try {
+            await authService.signup(params);
+            dispatch({ type: 'CLEAR_ERROR' });
+        } catch (error: any) {
+            const msg = error.message || 'Signup failed';
+            dispatch({ type: 'LOGIN_FAILURE', payload: { error: msg } });
+            throw error;
+        }
+    };
 
-export function useAuth() {
-    const ctx = useContext(AuthContext);
-    if (!ctx) throw new Error("useAuth must be used within AuthProvider");
-    return ctx;
-}
+    const verify = async (params: any) => {
+        dispatch({ type: 'LOGIN_START' });
+        try {
+            const res = await authService.verifyEmail(params);
+            dispatch({ type: 'LOGIN_SUCCESS', payload: { user: res.user } });
+        } catch (error: any) {
+            const msg = error.message || 'Verification failed';
+            dispatch({ type: 'LOGIN_FAILURE', payload: { error: msg } });
+            throw error;
+        }
+    };
+
+    const logout = async () => {
+        try {
+            await authService.signout();
+        } catch (error) {
+            console.error("Logout error", error);
+        } finally {
+            dispatch({ type: 'LOGOUT' });
+        }
+    };
+
+    // ... (Các hàm resend, refreshProfile, clearError giữ nguyên) ...
+    const resend = async (email: string) => {
+        try {
+            await authService.resendVerification(email);
+        } catch (error) {
+            throw error;
+        }
+    };
+
+    const refreshProfile = async () => {
+        try {
+            const user = await authService.me();
+            dispatch({ type: 'LOGIN_SUCCESS', payload: { user } });
+        } catch (error) {
+            dispatch({ type: 'LOGOUT' });
+        }
+    }
+
+    const clearError = () => dispatch({ type: 'CLEAR_ERROR' });
+
+    return (
+        <AuthContext.Provider
+            value={{
+                ...state,
+                login,
+                register,
+                verify,
+                logout,
+                resend,
+                refreshProfile,
+                clearError,
+            }}
+        >
+            {children}
+        </AuthContext.Provider>
+    );
+};

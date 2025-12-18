@@ -1,11 +1,11 @@
 import { ENVARS } from "@/lib/envars";
 
-export const authApi = {
-    SIGNIN: `${ENVARS.NEXT_PUBLIC_SERVER_URL}/auth/signin`,
-    SIGNUP: `${ENVARS.NEXT_PUBLIC_SERVER_URL}/auth/signup`,
-    SIGNOUT: `${ENVARS.NEXT_PUBLIC_SERVER_URL}/auth/signout`,
-    ME: `${ENVARS.NEXT_PUBLIC_SERVER_URL}/auth/me`,
-    REFRESH: `${ENVARS.NEXT_PUBLIC_SERVER_URL}/auth/refresh`,
-    VERIFY_EMAIL: `${ENVARS.NEXT_PUBLIC_SERVER_URL}/auth/verify-email`,
-    RESEND_VERIFICATION: `${ENVARS.NEXT_PUBLIC_SERVER_URL}/auth/resend-verification`,
-}
+export const AUTH_ENDPOINTS = {
+    SIGNIN: "/auth/signin",
+    SIGNUP: "/auth/signup",
+    SIGNOUT: "/auth/signout",
+    ME: "/auth/me",
+    REFRESH: "/auth/refresh",
+    VERIFY_EMAIL: "/auth/verify-email",
+    RESEND_VERIFICATION: "/auth/resend-verification",
+} as const;

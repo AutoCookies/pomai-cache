@@ -1,6 +1,5 @@
-// This is a server component by default; it can include client components (Providers) as children.
 import "./globals.css";
-import Providers from "./provider"; // client component
+import Providers from "./provider";
 
 export const metadata = {
   title: "Pomai Cache UI",
@@ -9,9 +8,8 @@ export const metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="en" className="dark">
       <body>
-        {/* Providers is a client component that wraps the app and provides AuthContext */}
         <Providers>
           {children}
         </Providers>
