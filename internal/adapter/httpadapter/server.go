@@ -3,34 +3,39 @@ package httpadapter
 import (
 	"net/http"
 
-	"github.com/AutoCookies/pomai-cache/internal/core/ports" // Import ports
+	"github.com/AutoCookies/pomai-cache/internal/core/ports"
+	"github.com/AutoCookies/pomai-cache/internal/core/services"
 	"github.com/AutoCookies/pomai-cache/internal/engine"
 	"github.com/gorilla/mux"
 )
 
 // Server wraps handlers for cache engine and auth
 type Server struct {
-	tenants     *engine.TenantManager
-	authHandler *AuthHandler
-	tokenMaker  ports.TokenMaker // [MỚI] Cần cái này để verify token
-	requireAuth bool
-	router      *mux.Router
+	tenants       *engine.TenantManager
+	authHandler   *AuthHandler
+	tokenMaker    ports.TokenMaker
+	requireAuth   bool
+	router        *mux.Router
+	apiKeyHandler *APIKeyHandler // Thêm API_KEY Handler
 }
 
 // NewServer creates a new API Server instance
-// [CẬP NHẬT] Thêm tham số tokenMaker
 func NewServer(
 	tenants *engine.TenantManager,
 	authHandler *AuthHandler,
-	tokenMaker ports.TokenMaker, // [MỚI]
+	tokenMaker ports.TokenMaker,
 	requireAuth bool,
+	apiKeyService services.APIKeyService, // Phụ thuộc API_KEY Service
 ) *Server {
+	apiKeyHandler := NewAPIKeyHandler(apiKeyService) // Khởi tạo APIKeyHandler
+
 	s := &Server{
-		tenants:     tenants,
-		authHandler: authHandler,
-		tokenMaker:  tokenMaker, // [MỚI]
-		requireAuth: requireAuth,
-		router:      mux.NewRouter(),
+		tenants:       tenants,
+		authHandler:   authHandler,
+		tokenMaker:    tokenMaker,
+		requireAuth:   requireAuth,
+		router:        mux.NewRouter(),
+		apiKeyHandler: apiKeyHandler,
 	}
 	s.setupRoutes()
 	return s

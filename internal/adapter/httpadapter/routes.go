@@ -20,7 +20,6 @@ func (s *Server) setupRoutes() {
 	// --- AUTH ROUTES ---
 	auth := s.router.PathPrefix("/auth").Subrouter()
 
-	// Public Routes (Không cần Middleware check token)
 	auth.HandleFunc("/signup", s.authHandler.HandleSignup).Methods("POST")
 	auth.HandleFunc("/signin", s.authHandler.HandleLogin).Methods("POST")
 	auth.HandleFunc("/verify-email", s.authHandler.HandleVerifyEmail).Methods("POST")
@@ -28,8 +27,13 @@ func (s *Server) setupRoutes() {
 	auth.HandleFunc("/refresh", s.authHandler.HandleRefresh).Methods("POST")
 	auth.HandleFunc("/signout", s.authHandler.HandleSignOut).Methods("POST")
 
-	// Protected Auth Routes (Cần Token)
 	auth.HandleFunc("/me", s.authMiddleware(s.authHandler.HandleMe)).Methods("GET")
+
+	// --- API_KEY ROUTES ---
+	apiKeys := s.router.PathPrefix("/api-key").Subrouter()
+
+	apiKeys.HandleFunc("/generate", s.authMiddleware(s.apiKeyHandler.HandleGenerate)).Methods("POST")
+	apiKeys.HandleFunc("/validate", s.authMiddleware(s.apiKeyHandler.HandleValidate)).Methods("GET")
 
 	// --- CACHE ROUTES (Protected) ---
 	api.HandleFunc("/cache/{key}", s.authMiddleware(s.handlePut)).Methods("PUT")
@@ -40,7 +44,6 @@ func (s *Server) setupRoutes() {
 	// Stats
 	api.HandleFunc("/stats", s.authMiddleware(s.handleStats)).Methods("GET")
 
-	// Health (Public)
 	s.router.HandleFunc("/health", s.handleHealth).Methods("GET")
 }
 
