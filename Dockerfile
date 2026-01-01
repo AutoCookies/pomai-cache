@@ -1,38 +1,36 @@
-# --- Giai đoạn 1: Builder ---
+# Stage 1: Build
 FROM golang:1.25-alpine AS builder
-
-# Cài đặt git để tải dependencies (nếu cần)
-RUN apk add --no-cache git
 
 WORKDIR /app
 
-# Copy file dependency trước để tận dụng Docker Cache
+# Copy dependency files
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy toàn bộ code nguồn
+# Copy source code
 COPY . .
 
-# Build ứng dụng
-# [QUAN TRỌNG] Trỏ đúng vào file main.go nằm trong cmd/server
-RUN CGO_ENABLED=0 GOOS=linux go build -o pomai-server ./cmd/server
+# Build binary (Static binary)
+RUN CGO_ENABLED=0 GOOS=linux go build -o pomai-server ./cmd/server/main.go
 
-# --- Giai đoạn 2: Runner (Siêu nhẹ) ---
+# Stage 2: Run (Dùng Alpine cho nhẹ)
 FROM alpine:latest
 
-# Cài đặt CA Certificates để gọi HTTPS (quan trọng cho Firebase/Resend)
-# Cài thêm tzdata để log đúng giờ Việt Nam
-RUN apk --no-cache add ca-certificates tzdata
+WORKDIR /root/
 
-WORKDIR /app
-
-# Copy binary từ giai đoạn builder
+# Copy binary từ builder
 COPY --from=builder /app/pomai-server .
 
-# Tạo thư mục chứa dữ liệu cache (Persistence)
-RUN mkdir -p /data/cache
+# Tạo thư mục data để mount volume
+RUN mkdir -p ./data
 
-# Expose port theo .env
+# Thiết lập biến môi trường mặc định
+ENV PORT=8080
+ENV DATA_DIR=./data
+ENV SHARD_COUNT=256
+ENV PERSISTENCE=file
+
+# Expose port
 EXPOSE 8080
 
 # Chạy server

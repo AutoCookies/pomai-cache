@@ -1,34 +1,37 @@
-// File: internal/cache/store.go
 package engine
 
 import (
 	"container/list"
-	"context"
-	"encoding/gob"
 	"errors"
-	"fmt" // [SỬA] Thêm import
+	"fmt"
 	"hash/fnv"
-	"io"
 	"math/rand"
-	"strconv" // [SỬA] Thêm import
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/golang/snappy"
+	"golang.org/x/sync/singleflight"
+
+	"github.com/AutoCookies/pomai-cache/packages/ds/bloom"
+	"github.com/AutoCookies/pomai-cache/packages/ds/sketch"
+	"github.com/AutoCookies/pomai-cache/packages/ds/skiplist"
 )
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
-type snapshotItem struct {
-	Key        string
-	Value      []byte
-	ExpireAt   int64
-	LastAccess int64
-	Accesses   uint64
-	CreatedAt  int64
+// Global controllers (Dependency Injection is better, but keeping for compatibility)
+var GlobalMemCtrl *MemoryController
+var GlobalFreq *sketch.Sketch
+
+func InitGlobalFreq(width, depth uint32) {
+	GlobalFreq = sketch.New(width, depth)
 }
 
+// entry là đơn vị lưu trữ cơ bản trong RAM
 type entry struct {
 	key        string
 	value      []byte
@@ -39,6 +42,7 @@ type entry struct {
 	createdAt  int64
 }
 
+// shard giúp chia nhỏ lock để tăng performance (giảm contention)
 type shard struct {
 	mu    sync.RWMutex
 	items map[string]*list.Element
@@ -46,35 +50,48 @@ type shard struct {
 	bytes int64
 }
 
+// Store là struct trung tâm quản lý Cache
 type Store struct {
 	shards        []*shard
 	shardCount    uint32
 	capacityBytes int64
 
+	// Metrics & Counters
 	totalBytesAtomic int64
 	freqBoost        int64
+	hits             uint64
+	misses           uint64
+	evictions        uint64
 
-	hits      uint64
-	misses    uint64
-	evictions uint64
+	// Feature modules
+	adaptiveTTL *AdaptiveTTL
 
-	adaptiveTTL *AdaptiveTTL // ✅ Adaptive TTL engine
-	bloom       *BloomFilter // ✅ Bloom filter for fast negative lookups
-	bloomStats  BloomStats   // ✅ Bloom filter statistics
+	// [PKG] Sử dụng BloomFilter từ pkg/ds/bloom
+	bloom      *bloom.BloomFilter
+	bloomStats BloomStats
+
+	// Singleflight để chống Thundering Herd (gộp request)
+	g singleflight.Group
+
+	// [PKG] Sử dụng Skiplist từ pkg/ds/skiplist cho ZSET
+	zsets map[string]*skiplist.Skiplist
+	zmu   sync.RWMutex
 }
 
-// ✅ Bloom filter statistics
+// BloomStats struct giữ metric của Bloom Filter
 type BloomStats struct {
-	Hits              uint64 // Bloom said "maybe" and key was found
-	Misses            uint64 // Bloom said "maybe" but key not found (false positive)
-	Avoided           uint64 // Bloom said "no" - avoided shard lock
+	Hits              uint64
+	Misses            uint64
+	Avoided           uint64
 	FalsePositiveRate float64
 }
 
+// NewStore tạo store mặc định
 func NewStore(shardCount int) *Store {
 	return NewStoreWithOptions(shardCount, 0)
 }
 
+// NewStoreWithOptions tạo store với cấu hình chi tiết
 func NewStoreWithOptions(shardCount int, capacityBytes int64) *Store {
 	if shardCount <= 0 {
 		shardCount = 256
@@ -85,6 +102,7 @@ func NewStoreWithOptions(shardCount int, capacityBytes int64) *Store {
 		shardCount:    uint32(shardCount),
 		capacityBytes: capacityBytes,
 		freqBoost:     1_000_000,
+		zsets:         make(map[string]*skiplist.Skiplist),
 	}
 	for i := 0; i < shardCount; i++ {
 		s.shards[i] = &shard{
@@ -95,62 +113,7 @@ func NewStoreWithOptions(shardCount int, capacityBytes int64) *Store {
 	return s
 }
 
-// ✅ EnableBloomFilter enables bloom filter for fast negative lookups
-// size: number of bits (e.g., 10_000_000 for ~1.2MB memory)
-// k: number of hash functions (3-5 is typical, 4 is optimal for ~1% false positive rate)
-func (s *Store) EnableBloomFilter(size uint64, k uint64) {
-	s.bloom = NewBloomFilter(size, k)
-
-	// Populate bloom filter with existing keys
-	populated := 0
-	for _, sh := range s.shards {
-		sh.mu.RLock()
-		for key := range sh.items {
-			s.bloom.Add(key)
-			populated++
-		}
-		sh.mu.RUnlock()
-	}
-
-	_ = populated
-}
-
-// ✅ DisableBloomFilter disables bloom filter
-func (s *Store) DisableBloomFilter() {
-	s.bloom = nil
-}
-
-// ✅ GetBloomStats returns bloom filter statistics
-func (s *Store) GetBloomStats() BloomStats {
-	hits := atomic.LoadUint64(&s.bloomStats.Hits)
-	misses := atomic.LoadUint64(&s.bloomStats.Misses)
-	avoided := atomic.LoadUint64(&s.bloomStats.Avoided)
-
-	stats := BloomStats{
-		Hits:    hits,
-		Misses:  misses,
-		Avoided: avoided,
-	}
-
-	// Calculate false positive rate
-	if hits+misses > 0 {
-		stats.FalsePositiveRate = float64(misses) / float64(hits+misses) * 100
-	}
-
-	return stats
-}
-
-func (s *Store) EnableAdaptiveTTL(minTTL, maxTTL time.Duration) {
-	s.adaptiveTTL = NewAdaptiveTTL(minTTL, maxTTL)
-}
-
-func (s *Store) DisableAdaptiveTTL() {
-	s.adaptiveTTL = nil
-}
-
-func (s *Store) SetFreqBoost(nanoseconds int64) {
-	atomic.StoreInt64(&s.freqBoost, nanoseconds)
-}
+// --- Helper Functions ---
 
 func (s *Store) getShard(key string) *shard {
 	h := fnv.New32a()
@@ -165,149 +128,286 @@ func (s *Store) hashToShardIndex(key string) int {
 	return int(h.Sum32() % s.shardCount)
 }
 
-func (s *Store) Put(key string, value []byte, ttl time.Duration) {
+// --- Core Operations (Put, Get, Delete, Incr) ---
+
+// Put lưu key-value vào cache
+func (s *Store) Put(key string, value []byte, ttl time.Duration) error {
 	if key == "" {
-		return
+		return errors.New("missing key")
 	}
+
+	// Copy value để an toàn bộ nhớ (tránh race condition nếu caller sửa buffer ngoài)
 	vcopy := make([]byte, len(value))
 	copy(vcopy, value)
+	newSize := len(vcopy)
 
+	// Tính toán TTL
 	now := time.Now().UnixNano()
 	var expireAt int64
+	if ttl > 0 {
+		expireAt = time.Now().Add(ttl).UnixNano()
+	}
+
+	// [LOGIC TINY-LFU] Kiểm tra Admission Control (Code nằm ở store_eviction.go)
+	if s.capacityBytes > 0 && GlobalFreq != nil {
+		if !s.admitOrRejectTinyLFU(key, newSize) {
+			return fmt.Errorf("insufficient storage (TinyLFU rejected)")
+		}
+	}
 
 	sh := s.getShard(key)
 	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
 	if elem, ok := sh.items[key]; ok {
+		// --- UPDATE EXISTING ---
 		ent := elem.Value.(*entry)
 		oldSize := ent.size
+		delta := int64(newSize - oldSize)
 
-		if s.adaptiveTTL != nil && ttl > 0 {
-			age := time.Since(time.Unix(0, ent.createdAt))
-			accesses := atomic.LoadUint64(&ent.accesses)
-			adaptiveTTL := s.adaptiveTTL.ComputeTTL(accesses, age)
-			expireAt = time.Now().Add(adaptiveTTL).UnixNano()
-		} else if ttl > 0 {
-			expireAt = time.Now().Add(ttl).UnixNano()
+		// Kiểm tra OOM Guard toàn cục
+		if delta > 0 && GlobalMemCtrl != nil && !GlobalMemCtrl.Reserve(delta) {
+			return fmt.Errorf("insufficient storage (OOM Guard)")
 		}
 
+		// Update entry data
 		ent.value = vcopy
-		ent.size = len(vcopy)
-		ent.expireAt = expireAt
+		ent.size = newSize
+		ent.expireAt = expireAt // Reset TTL on update
 		ent.lastAccess = now
 		atomic.AddUint64(&ent.accesses, 1)
-		sh.bytes += int64(ent.size - oldSize)
-		sh.ll.MoveToFront(elem)
-		atomic.AddInt64(&s.totalBytesAtomic, int64(ent.size-oldSize))
-		sh.mu.Unlock()
+
+		// Update metrics
+		sh.bytes += delta
+		sh.ll.MoveToFront(elem) // LRU update
+		atomic.AddInt64(&s.totalBytesAtomic, delta)
+
+		if delta < 0 && GlobalMemCtrl != nil {
+			GlobalMemCtrl.Release(-delta)
+		}
 	} else {
-		if ttl > 0 {
-			if s.adaptiveTTL != nil {
-				adaptiveTTL := s.adaptiveTTL.ComputeTTL(0, 0)
-				expireAt = time.Now().Add(adaptiveTTL).UnixNano()
-			} else {
-				expireAt = time.Now().Add(ttl).UnixNano()
+		// --- INSERT NEW ---
+
+		// [LOGIC EVICTION] Xả bớt nếu đầy (Code nằm ở store_eviction.go)
+		if s.capacityBytes > 0 && atomic.LoadInt64(&s.totalBytesAtomic)+int64(newSize) > s.capacityBytes {
+			// Thử evict tối đa 3 lần
+			for i := 0; i < 3; i++ {
+				s.evictIfNeeded(s.hashToShardIndex(key))
+				if atomic.LoadInt64(&s.totalBytesAtomic)+int64(newSize) <= s.capacityBytes {
+					break
+				}
 			}
+			// Check lại lần cuối
+			if atomic.LoadInt64(&s.totalBytesAtomic)+int64(newSize) > s.capacityBytes {
+				return fmt.Errorf("insufficient storage")
+			}
+		}
+
+		if GlobalMemCtrl != nil && !GlobalMemCtrl.Reserve(int64(newSize)) {
+			return fmt.Errorf("insufficient storage (OOM Guard)")
 		}
 
 		ent := &entry{
 			key:        key,
 			value:      vcopy,
-			size:       len(vcopy),
+			size:       newSize,
 			expireAt:   expireAt,
 			lastAccess: now,
 			accesses:   1,
 			createdAt:  now,
 		}
+
 		elem := sh.ll.PushFront(ent)
 		sh.items[key] = elem
-		sh.bytes += int64(ent.size)
-		atomic.AddInt64(&s.totalBytesAtomic, int64(ent.size))
+		sh.bytes += int64(newSize)
+		atomic.AddInt64(&s.totalBytesAtomic, int64(newSize))
 
-		// ✅ Add to bloom filter
+		// Add to Bloom Filter
 		if s.bloom != nil {
 			s.bloom.Add(key)
 		}
-
-		sh.mu.Unlock()
 	}
 
-	if s.capacityBytes > 0 {
-		s.evictIfNeeded(s.hashToShardIndex(key))
+	// Update Frequency Sketch (Count-Min Sketch)
+	if GlobalFreq != nil {
+		GlobalFreq.Increment(key)
+	}
+
+	return nil
+}
+
+// Get lấy value từ cache
+func (s *Store) Get(key string) ([]byte, bool) {
+	if key == "" {
+		atomic.AddUint64(&s.misses, 1)
+		return nil, false
+	}
+
+	// 1. Bloom Filter Check (Fast negative path)
+	if s.bloom != nil && !s.bloom.MayContain(key) {
+		atomic.AddUint64(&s.misses, 1)
+		atomic.AddUint64(&s.bloomStats.Avoided, 1)
+		return nil, false
+	}
+
+	sh := s.getShard(key)
+
+	// Dùng Read Lock để kiểm tra nhanh
+	sh.mu.RLock()
+	elem, ok := sh.items[key]
+	if !ok {
+		sh.mu.RUnlock()
+		atomic.AddUint64(&s.misses, 1)
+		if s.bloom != nil {
+			atomic.AddUint64(&s.bloomStats.Misses, 1) // False positive
+		}
+		return nil, false
+	}
+	if s.bloom != nil {
+		atomic.AddUint64(&s.bloomStats.Hits, 1)
+	}
+
+	ent := elem.Value.(*entry)
+
+	// 2. Check Expiration
+	if ent.expireAt != 0 && time.Now().UnixNano() > ent.expireAt {
+		sh.mu.RUnlock()
+		// Lazy Delete: Chuyển sang Write Lock để xóa (Hàm ở store_ttl.go)
+		s.deleteExpired(key)
+		atomic.AddUint64(&s.misses, 1)
+		return nil, false
+	}
+
+	// Copy value để trả về (tránh race condition)
+	val := make([]byte, len(ent.value))
+	copy(val, ent.value)
+	sh.mu.RUnlock()
+
+	// 3. Update Metadata (LRU & Access Count)
+	// Cần Write Lock để move list element.
+	// Để tối ưu, ta lock lại shard một lần nữa.
+	sh.mu.Lock()
+	if elem, ok := sh.items[key]; ok { // Check lại vì có thể bị xóa giữa chừng
+		ent := elem.Value.(*entry)
+		ent.lastAccess = time.Now().UnixNano()
+		atomic.AddUint64(&ent.accesses, 1)
+		sh.ll.MoveToFront(elem) // Đẩy lên đầu LRU
+	}
+	sh.mu.Unlock()
+
+	// Update Frequency Sketch (Async safe - không cần lock)
+	if GlobalFreq != nil {
+		GlobalFreq.Increment(key)
+	}
+
+	atomic.AddUint64(&s.hits, 1)
+	return val, true
+}
+
+// Delete xóa key
+func (s *Store) Delete(key string) {
+	if key == "" {
+		return
+	}
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	if elem, ok := sh.items[key]; ok {
+		ent := elem.Value.(*entry)
+		delete(sh.items, key)
+		sh.ll.Remove(elem)
+
+		// Update Memory
+		sh.bytes -= int64(ent.size)
+		atomic.AddInt64(&s.totalBytesAtomic, -int64(ent.size))
+		if GlobalMemCtrl != nil {
+			GlobalMemCtrl.Release(int64(ent.size))
+		}
 	}
 }
 
-// [SỬA] Incr tăng/giảm giá trị atomic cho key
+// Incr tăng giảm giá trị atomic (Hỗ trợ Snappy Magic Byte)
 func (s *Store) Incr(key string, delta int64) (int64, error) {
 	if key == "" {
 		return 0, errors.New("missing key")
 	}
 
-	now := time.Now().UnixNano()
 	sh := s.getShard(key)
 	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
 	var currentVal int64 = 0
-	var expireAt int64 = 0
-	var exists bool = false
 
-	// 1. Kiểm tra entry cũ
+	// 1. Get current value
 	if elem, ok := sh.items[key]; ok {
 		ent := elem.Value.(*entry)
-		// Check expired
-		if ent.expireAt != 0 && now > ent.expireAt {
-			// Expired: treat as not exist
-			delete(sh.items, key)
-			sh.ll.Remove(elem)
-			sh.bytes -= int64(ent.size)
-			atomic.AddInt64(&s.totalBytesAtomic, -int64(ent.size))
-			exists = false
-		} else {
-			exists = true
-			expireAt = ent.expireAt
-			// Parse existing value
-			valStr := string(ent.value)
-			val, err := strconv.ParseInt(valStr, 10, 64)
-			if err != nil {
-				sh.mu.Unlock()
-				return 0, fmt.Errorf("value is not an integer")
-			}
-			currentVal = val
 
-			// Update LRU info
-			ent.lastAccess = now
-			atomic.AddUint64(&ent.accesses, 1)
-			sh.ll.MoveToFront(elem)
+		// Decode Value logic (Giống Get nhưng Inline)
+		raw := ent.value
+		var valStr string
+		if len(raw) > 0 {
+			magic := raw[0]
+			payload := raw[1:]
+			if magic == 1 { // Compressed
+				decoded, err := snappy.Decode(nil, payload)
+				if err != nil {
+					return 0, fmt.Errorf("corrupted data")
+				}
+				valStr = string(decoded)
+			} else { // Raw
+				valStr = string(payload)
+			}
 		}
+
+		val, err := strconv.ParseInt(valStr, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("value is not an integer")
+		}
+		currentVal = val
 	}
 
-	// 2. Tính toán giá trị mới
+	// 2. Calculate new value
 	newVal := currentVal + delta
-	newValBytes := []byte(strconv.FormatInt(newVal, 10))
-	newSize := len(newValBytes)
 
-	// 3. Cập nhật Store
-	if exists {
-		elem := sh.items[key]
+	// 3. Encode (Luôn dùng Uncompressed cho Int để nhanh)
+	newValBytes := []byte(strconv.FormatInt(newVal, 10))
+	finalData := make([]byte, len(newValBytes)+1)
+	finalData[0] = 0 // Magic byte 0 = Uncompressed
+	copy(finalData[1:], newValBytes)
+
+	newSize := len(finalData)
+
+	// 4. Update Store (Logic giống Put nhưng Inline để giữ Lock)
+	if elem, ok := sh.items[key]; ok {
 		ent := elem.Value.(*entry)
 		oldSize := ent.size
+		deltaSize := int64(newSize - oldSize)
 
-		ent.value = newValBytes
-		ent.size = newSize
-		// ent.expireAt giữ nguyên
-		sh.bytes += int64(newSize - oldSize)
-		atomic.AddInt64(&s.totalBytesAtomic, int64(newSize-oldSize))
-	} else {
-		// Tạo mới
-		ent := &entry{
-			key:        key,
-			value:      newValBytes,
-			size:       newSize,
-			expireAt:   expireAt, // 0 (permanent) nếu mới tạo
-			lastAccess: now,
-			accesses:   1,
-			createdAt:  now,
+		if deltaSize > 0 && GlobalMemCtrl != nil && !GlobalMemCtrl.Reserve(deltaSize) {
+			return 0, fmt.Errorf("insufficient storage")
 		}
+
+		ent.value = finalData
+		ent.size = newSize
+		sh.bytes += deltaSize
+		atomic.AddInt64(&s.totalBytesAtomic, deltaSize)
+		sh.ll.MoveToFront(elem)
+
+		if deltaSize < 0 && GlobalMemCtrl != nil {
+			GlobalMemCtrl.Release(-deltaSize)
+		}
+	} else {
+		// New Insert for Incr
+		ent := &entry{
+			key: key, value: finalData, size: newSize,
+			expireAt: 0, lastAccess: time.Now().UnixNano(), accesses: 1, createdAt: time.Now().UnixNano(),
+		}
+
+		if GlobalMemCtrl != nil && !GlobalMemCtrl.Reserve(int64(newSize)) {
+			return 0, fmt.Errorf("insufficient storage")
+		}
+
 		elem := sh.ll.PushFront(ent)
 		sh.items[key] = elem
 		sh.bytes += int64(newSize)
@@ -318,572 +418,5 @@ func (s *Store) Incr(key string, delta int64) (int64, error) {
 		}
 	}
 
-	sh.mu.Unlock()
-
-	// 4. Eviction check (ngoài lock)
-	if s.capacityBytes > 0 {
-		s.evictIfNeeded(s.hashToShardIndex(key))
-	}
-
 	return newVal, nil
-}
-
-func (s *Store) PutAdaptive(key string, value []byte, baseTTL time.Duration) {
-	s.Put(key, value, baseTTL)
-}
-
-func (s *Store) RefreshTTL(key string) bool {
-	if key == "" || s.adaptiveTTL == nil {
-		return false
-	}
-
-	sh := s.getShard(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-
-	elem, ok := sh.items[key]
-	if !ok {
-		return false
-	}
-
-	ent := elem.Value.(*entry)
-	if ent.expireAt == 0 {
-		return false
-	}
-
-	age := time.Since(time.Unix(0, ent.createdAt))
-	accesses := atomic.LoadUint64(&ent.accesses)
-	newTTL := s.adaptiveTTL.ComputeTTL(accesses, age)
-	ent.expireAt = time.Now().Add(newTTL).UnixNano()
-
-	return true
-}
-
-func (s *Store) Get(key string) ([]byte, bool) {
-	if key == "" {
-		atomic.AddUint64(&s.misses, 1)
-		return nil, false
-	}
-
-	// ✅ Fast path: Check bloom filter first
-	if s.bloom != nil {
-		if !s.bloom.MayContain(key) {
-			// Definitely not present - avoid shard lock!
-			atomic.AddUint64(&s.misses, 1)
-			atomic.AddUint64(&s.bloomStats.Avoided, 1)
-			return nil, false
-		}
-		// Bloom says "maybe" - need to check actual store
-	}
-
-	sh := s.getShard(key)
-
-	sh.mu.RLock()
-	elem, ok := sh.items[key]
-	if !ok {
-		sh.mu.RUnlock()
-		atomic.AddUint64(&s.misses, 1)
-
-		// ✅ Bloom filter said "maybe" but key not found (false positive)
-		if s.bloom != nil {
-			atomic.AddUint64(&s.bloomStats.Misses, 1)
-		}
-
-		return nil, false
-	}
-
-	// ✅ Bloom filter was correct (true positive)
-	if s.bloom != nil {
-		atomic.AddUint64(&s.bloomStats.Hits, 1)
-	}
-
-	ent := elem.Value.(*entry)
-	now := time.Now().UnixNano()
-	if ent.expireAt != 0 && now > ent.expireAt {
-		sh.mu.RUnlock()
-
-		sh.mu.Lock()
-		elem2, ok2 := sh.items[key]
-		if !ok2 {
-			sh.mu.Unlock()
-			atomic.AddUint64(&s.misses, 1)
-			return nil, false
-		}
-		ent2 := elem2.Value.(*entry)
-		if ent2.expireAt != 0 && time.Now().UnixNano() > ent2.expireAt {
-			delete(sh.items, key)
-			sh.ll.Remove(elem2)
-			sh.bytes -= int64(ent2.size)
-			atomic.AddInt64(&s.totalBytesAtomic, -int64(ent2.size))
-
-			// Note: We don't remove from bloom filter (it's append-only)
-			// False positives will eventually be fixed by bloom filter rebuild
-
-			sh.mu.Unlock()
-			atomic.AddUint64(&s.misses, 1)
-			return nil, false
-		}
-		ent2.lastAccess = time.Now().UnixNano()
-		atomic.AddUint64(&ent2.accesses, 1)
-		sh.ll.MoveToFront(elem2)
-		out := make([]byte, len(ent2.value))
-		copy(out, ent2.value)
-		sh.mu.Unlock()
-		atomic.AddUint64(&s.hits, 1)
-		return out, true
-	}
-
-	sh.mu.RUnlock()
-
-	sh.mu.Lock()
-	elem2, ok2 := sh.items[key]
-	if !ok2 {
-		sh.mu.Unlock()
-		atomic.AddUint64(&s.misses, 1)
-		return nil, false
-	}
-	ent2 := elem2.Value.(*entry)
-	if ent2.expireAt != 0 && time.Now().UnixNano() > ent2.expireAt {
-		delete(sh.items, key)
-		sh.ll.Remove(elem2)
-		sh.bytes -= int64(ent2.size)
-		atomic.AddInt64(&s.totalBytesAtomic, -int64(ent2.size))
-		sh.mu.Unlock()
-		atomic.AddUint64(&s.misses, 1)
-		return nil, false
-	}
-	ent2.lastAccess = time.Now().UnixNano()
-	atomic.AddUint64(&ent2.accesses, 1)
-	sh.ll.MoveToFront(elem2)
-
-	if s.adaptiveTTL != nil && ent2.expireAt != 0 {
-		age := time.Since(time.Unix(0, ent2.createdAt))
-		accesses := atomic.LoadUint64(&ent2.accesses)
-		newTTL := s.adaptiveTTL.ComputeTTL(accesses, age)
-		ent2.expireAt = time.Now().Add(newTTL).UnixNano()
-	}
-
-	out := make([]byte, len(ent2.value))
-	copy(out, ent2.value)
-	sh.mu.Unlock()
-	atomic.AddUint64(&s.hits, 1)
-	return out, true
-}
-
-func (s *Store) Delete(key string) {
-	if key == "" {
-		return
-	}
-	sh := s.getShard(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	if elem, ok := sh.items[key]; ok {
-		ent := elem.Value.(*entry)
-		delete(sh.items, key)
-		sh.ll.Remove(elem)
-		sh.bytes -= int64(ent.size)
-		atomic.AddInt64(&s.totalBytesAtomic, -int64(ent.size))
-
-		// Note:  Bloom filter is append-only, we don't remove keys
-		// This creates false positives but they're harmless
-	}
-}
-
-// ✅ RebuildBloomFilter rebuilds bloom filter from scratch
-// Call this periodically to reduce false positive rate after many deletions
-func (s *Store) RebuildBloomFilter() int {
-	if s.bloom == nil {
-		return 0
-	}
-
-	// Get bloom filter config
-	oldSize := s.bloom.size
-	oldK := s.bloom.k
-
-	// Create new bloom filter
-	s.bloom = NewBloomFilter(oldSize, oldK)
-
-	// Repopulate with current keys
-	count := 0
-	for _, sh := range s.shards {
-		sh.mu.RLock()
-		for key := range sh.items {
-			s.bloom.Add(key)
-			count++
-		}
-		sh.mu.RUnlock()
-	}
-
-	// Reset bloom stats
-	atomic.StoreUint64(&s.bloomStats.Hits, 0)
-	atomic.StoreUint64(&s.bloomStats.Misses, 0)
-	atomic.StoreUint64(&s.bloomStats.Avoided, 0)
-
-	_ = count
-	return count
-}
-
-func (s *Store) TTLRemaining(key string) (time.Duration, bool) {
-	if key == "" {
-		return 0, false
-	}
-
-	// ✅ Bloom filter check
-	if s.bloom != nil && !s.bloom.MayContain(key) {
-		return 0, false
-	}
-
-	sh := s.getShard(key)
-	sh.mu.RLock()
-	elem, ok := sh.items[key]
-	if !ok {
-		sh.mu.RUnlock()
-		return 0, false
-	}
-	ent := elem.Value.(*entry)
-	if ent.expireAt == 0 {
-		sh.mu.RUnlock()
-		return 0, true
-	}
-	remain := time.Until(time.Unix(0, ent.expireAt))
-	if remain <= 0 {
-		sh.mu.RUnlock()
-		sh.mu.Lock()
-		if elem2, ok2 := sh.items[key]; ok2 {
-			ent2 := elem2.Value.(*entry)
-			if ent2.expireAt != 0 && time.Now().UnixNano() > ent2.expireAt {
-				delete(sh.items, key)
-				sh.ll.Remove(elem2)
-				sh.bytes -= int64(ent2.size)
-				atomic.AddInt64(&s.totalBytesAtomic, -int64(ent2.size))
-			}
-		}
-		sh.mu.Unlock()
-		return 0, false
-	}
-	sh.mu.RUnlock()
-	return remain, true
-}
-
-type candidate struct {
-	shardIdx int
-	key      string
-	priority int64
-	size     int
-}
-
-func (s *Store) evictIfNeeded(startShard int) {
-	if s.capacityBytes <= 0 {
-		return
-	}
-	if atomic.LoadInt64(&s.totalBytesAtomic) <= s.capacityBytes {
-		return
-	}
-
-	shardCount := int(s.shardCount)
-	start := startShard % shardCount
-	if start < 0 {
-		start = 0
-	}
-
-	const sampleShardLimit = 16
-	const perShardSamples = 2
-	const maxCandidates = 128
-
-	for atomic.LoadInt64(&s.totalBytesAtomic) > s.capacityBytes {
-		cands := make([]candidate, 0, 32)
-		for i := 0; i < sampleShardLimit && i < shardCount; i++ {
-			idx := (start + rand.Intn(shardCount)) % shardCount
-			sh := s.shards[idx]
-			sh.mu.RLock()
-			elem := sh.ll.Back()
-			count := 0
-			for elem != nil && count < perShardSamples {
-				ent := elem.Value.(*entry)
-				priority := ent.lastAccess + int64(atomic.LoadUint64(&ent.accesses))*atomic.LoadInt64(&s.freqBoost)
-				cands = append(cands, candidate{
-					shardIdx: idx,
-					key:      ent.key,
-					priority: priority,
-					size:     ent.size,
-				})
-				elem = elem.Prev()
-				count++
-				if len(cands) >= maxCandidates {
-					break
-				}
-			}
-			sh.mu.RUnlock()
-			if len(cands) >= maxCandidates {
-				break
-			}
-		}
-
-		if len(cands) == 0 {
-			break
-		}
-
-		best := cands[0]
-		for _, c := range cands[1:] {
-			if c.priority < best.priority {
-				best = c
-			}
-		}
-
-		sh := s.shards[best.shardIdx]
-		sh.mu.Lock()
-		elem, ok := sh.items[best.key]
-		if !ok {
-			sh.mu.Unlock()
-			start = (start + 1) % shardCount
-			continue
-		}
-		ent := elem.Value.(*entry)
-		curPriority := ent.lastAccess + int64(atomic.LoadUint64(&ent.accesses))*atomic.LoadInt64(&s.freqBoost)
-		if curPriority != best.priority {
-			sh.mu.Unlock()
-			start = (start + 1) % shardCount
-			continue
-		}
-		delete(sh.items, best.key)
-		sh.ll.Remove(elem)
-		sh.bytes -= int64(ent.size)
-		sh.mu.Unlock()
-
-		atomic.AddUint64(&s.evictions, 1)
-		atomic.AddInt64(&s.totalBytesAtomic, -int64(ent.size))
-
-		start = (start + 1) % shardCount
-	}
-}
-
-func (s *Store) totalBytesSnapshot() int64 {
-	return atomic.LoadInt64(&s.totalBytesAtomic)
-}
-
-func (s *Store) totalBytes() int64 {
-	return s.totalBytesSnapshot()
-}
-
-func (s *Store) SnapshotTo(w io.Writer) error {
-	enc := gob.NewEncoder(w)
-	if err := enc.Encode(int(1)); err != nil {
-		return err
-	}
-
-	for _, sh := range s.shards {
-		sh.mu.RLock()
-		for _, elem := range sh.items {
-			ent := elem.Value.(*entry)
-			if ent.expireAt != 0 && time.Now().UnixNano() > ent.expireAt {
-				continue
-			}
-			item := snapshotItem{
-				Key:        ent.key,
-				Value:      ent.value,
-				ExpireAt:   ent.expireAt,
-				LastAccess: ent.lastAccess,
-				Accesses:   atomic.LoadUint64(&ent.accesses),
-				CreatedAt:  ent.createdAt,
-			}
-			if err := enc.Encode(&item); err != nil {
-				sh.mu.RUnlock()
-				return err
-			}
-		}
-		sh.mu.RUnlock()
-	}
-	return nil
-}
-
-func (s *Store) RestoreFrom(r io.Reader) error {
-	dec := gob.NewDecoder(r)
-	var version int
-	if err := dec.Decode(&version); err != nil {
-		return err
-	}
-	if version != 1 {
-		return errors.New("unsupported snapshot version")
-	}
-
-	for {
-		var item snapshotItem
-		if err := dec.Decode(&item); err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return err
-		}
-		if item.ExpireAt != 0 && time.Now().UnixNano() > item.ExpireAt {
-			continue
-		}
-
-		sh := s.getShard(item.Key)
-		sh.mu.Lock()
-		if elem, ok := sh.items[item.Key]; ok {
-			old := elem.Value.(*entry)
-			delete(sh.items, item.Key)
-			sh.ll.Remove(elem)
-			sh.bytes -= int64(old.size)
-			atomic.AddInt64(&s.totalBytesAtomic, -int64(old.size))
-		}
-		ent := &entry{
-			key:        item.Key,
-			value:      item.Value,
-			size:       len(item.Value),
-			expireAt:   item.ExpireAt,
-			lastAccess: item.LastAccess,
-			accesses:   item.Accesses,
-			createdAt:  item.CreatedAt,
-		}
-		elem := sh.ll.PushFront(ent)
-		sh.items[item.Key] = elem
-		sh.bytes += int64(ent.size)
-		atomic.AddInt64(&s.totalBytesAtomic, int64(ent.size))
-
-		// ✅ Add restored keys to bloom filter
-		if s.bloom != nil {
-			s.bloom.Add(item.Key)
-		}
-
-		sh.mu.Unlock()
-	}
-}
-
-type Stats struct {
-	Hits           uint64
-	Misses         uint64
-	Items          int64
-	Bytes          int64
-	Capacity       int64
-	Evictions      uint64
-	ShardCount     int
-	FreqBoost      int64
-	AdaptiveTTL    bool
-	AdaptiveMinTTL string
-	AdaptiveMaxTTL string
-	BloomEnabled   bool    // ✅ Bloom filter status
-	BloomFPRate    float64 // ✅ False positive rate
-	BloomAvoided   uint64  // ✅ Lookups avoided by bloom
-}
-
-func (s *Store) Stats() Stats {
-	var totalItems int64
-	var totalBytes int64
-	for _, sh := range s.shards {
-		sh.mu.RLock()
-		totalItems += int64(len(sh.items))
-		totalBytes += sh.bytes
-		sh.mu.RUnlock()
-	}
-
-	stats := Stats{
-		Hits:         atomic.LoadUint64(&s.hits),
-		Misses:       atomic.LoadUint64(&s.misses),
-		Items:        totalItems,
-		Bytes:        totalBytes,
-		Capacity:     s.capacityBytes,
-		Evictions:    atomic.LoadUint64(&s.evictions),
-		ShardCount:   int(s.shardCount),
-		FreqBoost:    atomic.LoadInt64(&s.freqBoost),
-		AdaptiveTTL:  s.adaptiveTTL != nil,
-		BloomEnabled: s.bloom != nil,
-	}
-
-	if s.adaptiveTTL != nil {
-		stats.AdaptiveMinTTL = s.adaptiveTTL.minTTL.String()
-		stats.AdaptiveMaxTTL = s.adaptiveTTL.maxTTL.String()
-	}
-
-	if s.bloom != nil {
-		bloomStats := s.GetBloomStats()
-		stats.BloomFPRate = bloomStats.FalsePositiveRate
-		stats.BloomAvoided = bloomStats.Avoided
-	}
-
-	return stats
-}
-
-func (s *Store) StartCleanup(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				s.cleanupExpired()
-			}
-		}
-	}()
-}
-
-func (s *Store) cleanupExpired() {
-	now := time.Now().UnixNano()
-	cleaned := 0
-
-	for _, sh := range s.shards {
-		sh.mu.Lock()
-		toDelete := []string{}
-
-		for key, elem := range sh.items {
-			ent := elem.Value.(*entry)
-			if ent.expireAt != 0 && now > ent.expireAt {
-				toDelete = append(toDelete, key)
-			}
-		}
-
-		for _, key := range toDelete {
-			if elem, ok := sh.items[key]; ok {
-				ent := elem.Value.(*entry)
-				delete(sh.items, key)
-				sh.ll.Remove(elem)
-				sh.bytes -= int64(ent.size)
-				atomic.AddInt64(&s.totalBytesAtomic, -int64(ent.size))
-				cleaned++
-			}
-		}
-
-		sh.mu.Unlock()
-	}
-
-	if cleaned > 0 {
-		// Rebuild bloom filter after cleanup if many keys were removed
-		if s.bloom != nil && cleaned > 1000 {
-			s.RebuildBloomFilter()
-		}
-	}
-}
-
-func (s *Store) CleanupExpired() int {
-	now := time.Now().UnixNano()
-	cleaned := 0
-
-	for _, sh := range s.shards {
-		sh.mu.Lock()
-		toDelete := []string{}
-
-		for key, elem := range sh.items {
-			ent := elem.Value.(*entry)
-			if ent.expireAt != 0 && now > ent.expireAt {
-				toDelete = append(toDelete, key)
-			}
-		}
-
-		for _, key := range toDelete {
-			if elem, ok := sh.items[key]; ok {
-				ent := elem.Value.(*entry)
-				delete(sh.items, key)
-				sh.ll.Remove(elem)
-				sh.bytes -= int64(ent.size)
-				atomic.AddInt64(&s.totalBytesAtomic, -int64(ent.size))
-				cleaned++
-			}
-		}
-
-		sh.mu.Unlock()
-	}
-
-	return cleaned
 }

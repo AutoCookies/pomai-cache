@@ -10,6 +10,7 @@ cache-server
 *.exe
 *.test
 *.out
+.history
 
 # Không ignore go.sum! 
 # go.sum  <-- ĐỪNG IGNORE CÁI NÀY

@@ -1,5 +1,0 @@
-# robots.txt for Pomai Cache UI (frontend only)
-User-agent: *
-Allow: /
-
-Sitemap: https://pomai-cache.cookiescooker.click/sitemap.xml

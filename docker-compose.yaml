@@ -1,52 +1,19 @@
-version: '3.8'
-
 services:
-  # 1. Ứng dụng Pomai Cache
-  server:
+  pomai-cache:
     build: .
-    image: autocookies/pomai_server:pomai-cache
-    restart: always
+    container_name: pomai-cache-node
+    restart: unless-stopped
     ports:
       - "8080:8080"
-    env_file:
-      - .env
-    environment:
-      # Ghi đè cấu hình để chạy trong môi trường Docker
-      - ENV=production
-      # [QUAN TRỌNG] Đổi localhost thành tên service 'postgres'
-      - POSTGRESQL_HOST=postgres://pomaicache_admin:Quanlatui777****@postgres:5432/pomaicache?sslmode=disable
-      # Trỏ đường dẫn lưu cache vào volume trong container
-      - DATA_DIR=/data/cache
-      # Config public url cho SDK discovery (nếu deploy thật hãy đổi thành domain thật)
-      - PUBLIC_URL=http://localhost:8080
     volumes:
-      # Mount thư mục persist cache ra ngoài máy thật để không mất dữ liệu khi restart
-      - ./pomai_data:/data/cache
-    depends_on:
-      - postgres
-
-  # 2. Database PostgreSQL
-  postgres:
-    image: postgres:15-alpine
-    container_name: pomai_postgres
-    restart: always
+      # Map thư mục data của máy thật vào container (đồng nhất với Dockerfile /data)
+      - ./data:/data
     environment:
-      # Lấy thông tin khớp với file .env của bạn
-      POSTGRES_USER: pomaicache_admin
-      POSTGRES_PASSWORD: Quanlatui777****
-      POSTGRES_DB: pomaicache
-    ports:
-      - "5432:5432"
-    volumes:
-      # Lưu dữ liệu DB bền vững
-      - postgres_data:/var/lib/postgresql/data
-      # Tự động chạy script tạo bảng khi khởi động lần đầu
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - PORT=8080
+      - DATA_DIR=/data
+    # Healthcheck: dùng curl -f (curl có thể cần được cài trong image)
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U pomaicache_admin -d pomaicache" ]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-volumes:
-  postgres_data:
+      test: [ "CMD", "sh", "-c", "curl -f http://localhost:8080/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3

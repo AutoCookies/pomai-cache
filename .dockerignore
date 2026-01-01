@@ -7,7 +7,7 @@
 . env.*
 
 # Build artifacts
-*. exe
+*.exe
 *.exe~
 *.dll
 *.so

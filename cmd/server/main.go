@@ -2,275 +2,193 @@ package main
 
 import (
 	"context"
-	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
 
-	// [Adapter Imports]
-	httpadapter "github.com/AutoCookies/pomai-cache/internal/adapter/httpadapter"
+	httpAdapter "github.com/AutoCookies/pomai-cache/internal/adapter/http"
 	"github.com/AutoCookies/pomai-cache/internal/adapter/persistence"
+	"github.com/AutoCookies/pomai-cache/internal/adapter/persistence/file"
+	"github.com/AutoCookies/pomai-cache/internal/adapter/persistence/wal"
+	tcpAdapter "github.com/AutoCookies/pomai-cache/internal/adapter/tcp"
 
-	// Import Firebase
-	firebase_setup "github.com/AutoCookies/pomai-cache/internal/adapter/firebase"
-	"github.com/AutoCookies/pomai-cache/internal/adapter/postgresql"
-
-	// Import Auth Adapters (Đảm bảo bạn đã tạo các package này từ các bước trước)
-	"github.com/AutoCookies/pomai-cache/internal/adapter/email"
-	"github.com/AutoCookies/pomai-cache/internal/adapter/token"
-
-	// [Core Imports]
 	"github.com/AutoCookies/pomai-cache/internal/core/ports"
-	"github.com/AutoCookies/pomai-cache/internal/core/services"
 	"github.com/AutoCookies/pomai-cache/internal/engine"
 )
 
-func main() {
-	// ============================================================
-	// 0. Load Environment Variables
-	// ============================================================
-	// Cố gắng load file .env. Nếu không thấy (ví dụ chạy trên Docker/Prod đã có env thật) thì bỏ qua lỗi.
-	// Hàm này sẽ tìm file .env ở thư mục hiện tại chạy lệnh terminal.
-	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found or failed to load, relying on system env vars")
-	} else {
-		log.Println("Loaded environment variables from .env")
+// Helper đọc Int từ Env
+func getenvInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
-	// ============================================================
-	// 1. Configuration
-	// ============================================================
-	var (
-		portEnv     = getEnv("PORT", "8080")
-		shardsEnv   = getEnv("CACHE_SHARDS", "32")
-		gracefulSec = getEnv("GRACEFUL_SHUTDOWN_SEC", "10")
+	return def
+}
 
-		// Cache Config
-		perTenantCapacity = getEnv("PER_TENANT_CAPACITY_BYTES", "104857600")
-		cleanupSec        = getEnv("CLEANUP_INTERVAL_SEC", "60")
+// Helper đọc Duration từ Env
+func getenvDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
 
-		// TTL & Bloom
-		enableAdaptiveTTL = getEnv("ENABLE_ADAPTIVE_TTL", "true")
-		adaptiveMinTTL    = getEnv("ADAPTIVE_MIN_TTL", "1m")
-		adaptiveMaxTTL    = getEnv("ADAPTIVE_MAX_TTL", "1h")
-		enableBloom       = getEnv("ENABLE_BLOOM_FILTER", "true")
-		bloomSize         = getEnv("BLOOM_SIZE", "10000000")
-		bloomK            = getEnv("BLOOM_K", "4")
+// Helper đọc String từ Env
+func getenv(key string, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
-		// Persistence
-		persistenceType   = getEnv("PERSISTENCE_TYPE", "file")
-		dataDir           = getEnv("DATA_DIR", "./data")
-		snapshotInterval  = getEnv("SNAPSHOT_INTERVAL", "5m")
-		enableWriteBehind = getEnv("ENABLE_WRITE_BEHIND", "false")
-		writeBufferSize   = getEnv("WRITE_BUFFER_SIZE", "1000")
-		flushInterval     = getEnv("FLUSH_INTERVAL", "5s")
+func main() {
+	// 1. Load .env file (nếu có)
+	_ = godotenv.Load() // Bỏ qua lỗi nếu không có file .env (chạy bằng biến môi trường hệ thống)
 
-		// Auth Config
-		tokenSecret  = getEnv("JWT_ACCESS_SECRET", "12345678901234567890123456789012") // 32 chars min
-		resendAPIKey = os.Getenv("RESEND_API_KEY")
-		resendFrom   = getEnv("RESEND_FROM_EMAIL", "Cookiescooker <no-reply@cookiescooker.click>")
+	// 2. Config từ ENV
+	httpPort := getenv("PORT", "8080")
+	tcpPort := getenv("TCP_PORT", "9090") // Mặc định 9090 cho Pomai Protocol
+	dataDir := getenv("DATA_DIR", "./data")
 
-		// Flags
-		addrFlag      = flag.String("addr", ":"+portEnv, "listen address")
-		shardsFlag    = flag.Int("shards", atoiDefault(shardsEnv, 32), "shard count")
-		perTenantFlag = flag.Int64("perTenantCapacity", atoi64Default(perTenantCapacity, 100*1024*1024), "per-user capacity bytes")
-		gracefulFlag  = flag.Int("graceful", atoiDefault(gracefulSec, 10), "graceful shutdown seconds")
-		cleanupFlag   = flag.Int("cleanup", atoiDefault(cleanupSec, 60), "cleanup interval seconds")
-	)
+	// Cấu hình Cache
+	shardCount := getenvInt("CACHE_SHARDS", 256)
+	perTenantCapacity := int64(getenvInt("PER_TENANT_CAPACITY_BYTES", 0)) // 0 = Unlimited
 
-	flag.Parse()
+	// Cấu hình Persistence
+	persistType := getenv("PERSISTENCE_TYPE", "noop") // file, wal, noop
 
-	log.Printf("🚀 Pomegranate Server starting on %s", *addrFlag)
+	// Cấu hình Write-Behind
+	wbMax := getenvInt("WRITE_BUFFER_SIZE", 1000)
+	wbFlushInterval := getenvDuration("FLUSH_INTERVAL", 5*time.Second)
 
+	log.Printf("CONFIG: Shards=%d, Cap=%d bytes, Persist=%s, WB=%d/%v",
+		shardCount, perTenantCapacity, persistType, wbMax, wbFlushInterval)
+
+	// 3. Init Engine
+	// Bloom Filter & Sketch config (Hardcode hoặc thêm env nếu muốn)
+	engine.InitGlobalFreq(65536, 4)
+
+	tm := engine.NewTenantManager(shardCount, perTenantCapacity)
+
+	// 4. Setup Persistence Strategy
+	var pers ports.Persister
+	var persImpl interface{} // Dùng để check interface Snapshotter
+
+	// Tạo thư mục data nếu chưa có
+	_ = os.MkdirAll(dataDir, 0755)
+
+	switch persistType {
+	case "file":
+		fp, err := file.NewFilePersister(dataDir)
+		if err != nil {
+			log.Fatalf("failed to create file persister: %v", err)
+		}
+		pers = fp
+		persImpl = fp
+	case "wal":
+		walPath := fmt.Sprintf("%s/wal.log", dataDir)
+		wp, err := wal.NewWALPersister(walPath)
+		if err != nil {
+			log.Fatalf("failed to create wal persister: %v", err)
+		}
+		// Restore dữ liệu từ WAL khi khởi động
+		log.Println("Restoring from WAL...")
+		defaultStore := tm.GetStore("default")
+		if err := wp.Restore(defaultStore); err != nil {
+			log.Printf("WAL Restore warning: %v", err)
+		}
+		pers = wp
+		persImpl = wp
+	default:
+		np := persistence.NewNoOpPersister()
+		pers = np
+		persImpl = np
+	}
+
+	// 5. Start Write-Behind (Background Worker)
+	wb := persistence.NewWriteBehindBuffer(wbMax, wbFlushInterval, pers)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	wb.Start(ctx)
 
-	postgresql.InitializePostgreSQL() // Đảm bảo sử dụng Singleton để khởi tạo một lần
-	postgresPool := postgresql.GetPostgresPool()
-
-	// ============================================================
-	// 2. Initialize Infrastructure (Firebase)
-	// ============================================================
-	log.Println("[INIT] Connecting to Firebase...")
-	firebase_setup.Initialize()
-	firestoreClient := firebase_setup.GetDB()
-
-	// ============================================================
-	// 3. Initialize Cache Engine
-	// ============================================================
-	log.Println("[INIT] Starting Cache Engine...")
-	tenants := engine.NewTenantManager(*shardsFlag, *perTenantFlag)
-	defaultStore := tenants.GetStore("default")
-
-	if enableAdaptiveTTL == "true" {
-		min, _ := time.ParseDuration(adaptiveMinTTL)
-		max, _ := time.ParseDuration(adaptiveMaxTTL)
-		defaultStore.EnableAdaptiveTTL(min, max)
-	}
-	if enableBloom == "true" {
-		size, _ := strconv.ParseUint(bloomSize, 10, 64)
-		k, _ := strconv.ParseUint(bloomK, 10, 64)
-		defaultStore.EnableBloomFilter(size, k)
-	}
-
-	// ============================================================
-	// 4. Initialize Persistence (Cache Layer)
-	// ============================================================
-	var persister ports.Persister
-	var err error
-
-	switch persistenceType {
-	case "file":
-		persister, err = persistence.NewFilePersister(filepath.Join(dataDir, "cache"))
-		if err != nil {
-			log.Fatalf("Failed to create file persister: %v", err)
-		}
-		if fp, ok := persister.(*persistence.FilePersister); ok {
-			_ = fp.Restore(defaultStore)
-			interval, _ := time.ParseDuration(snapshotInterval)
-			fp.StartPeriodicSnapshot(defaultStore, interval)
-		}
-	case "wal":
-		persister, err = persistence.NewWALPersister(filepath.Join(dataDir, "wal.log"))
-		if err != nil {
-			log.Fatalf("Failed to create WAL persister: %v", err)
-		}
-		if wp, ok := persister.(*persistence.WALPersister); ok {
-			_ = wp.Restore(defaultStore)
-		}
-	default:
-		persister = persistence.NewNoOpPersister()
-	}
-
-	if enableWriteBehind == "true" && persistenceType != "noop" {
-		bs, _ := strconv.Atoi(writeBufferSize)
-		fi, _ := time.ParseDuration(flushInterval)
-		wb := persistence.NewWriteBehindBuffer(bs, fi, persister)
-		wb.Start(ctx)
-		defer wb.Close()
-	} else {
-		defer persister.Close()
-	}
-
-	// ============================================================
-	// 5. Initialize Auth Stack (Wiring)
-	// ============================================================
-	log.Println("[INIT] Setting up Auth Stack...")
-
-	// 5.1 Repositories
-	authRepo := persistence.NewFirestoreAuthRepo(firestoreClient)
-	verifyRepo := persistence.NewFirestoreVerificationRepo(firestoreClient)
-
-	// 5.2 Token Maker
-	tokenMaker, err := token.NewJWTMaker(tokenSecret)
-	if err != nil {
-		log.Fatalf("Failed to create token maker: %v", err)
-	}
-
-	// 5.3 Email Sender
-	var emailSender ports.EmailSender
-	if resendAPIKey == "" {
-		log.Println("⚠️ RESEND_API_KEY missing. Email sending will fail/mock.")
-		// Fallback to mock/dummy adapter if needed
-		emailSender, _ = email.NewResendAdapter("mock_key", resendFrom)
-	} else {
-		emailSender, err = email.NewResendAdapter(resendAPIKey, resendFrom)
-		if err != nil {
-			log.Fatalf("Failed to create email adapter: %v", err)
-		}
-	}
-
-	// 5.4 Service
-	authService := services.NewAuthService(authRepo, verifyRepo, tokenMaker, emailSender)
-
-	// 5.5 Handler
-	authHandler := httpadapter.NewAuthHandler(authService)
-
-	// ============================================================
-	// 6. Initialize HTTP Server
-	// ============================================================
-	requireAuth := os.Getenv("REQUIRE_AUTH") == "true"
-
-	// Khởi tạo APIKeyRepo và APIKeyService
-	apiKeyRepo := persistence.NewAPIKeyRepo(postgresPool)  // Tạo repo APIKey
-	apiKeyService := services.NewAPIKeyService(apiKeyRepo) // Dùng APIKeyRepo trong service
-
-	// Truyền thêm apiKeyService vào NewServer
-	srv := httpadapter.NewServer(tenants, authHandler, tokenMaker, requireAuth, apiKeyService)
-
+	// 6. Init HTTP Server (Admin/Stats)
+	srv := httpAdapter.NewServer(tm)
 	httpSrv := &http.Server{
-		Addr:         *addrFlag,
-		Handler:      srv.Router(),
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:    ":" + httpPort,
+		Handler: srv.Router(),
 	}
 
+	// Chạy HTTP trong Goroutine
+	errCh := make(chan error, 1)
 	go func() {
+		log.Printf("HTTP Admin Server starting on :%s", httpPort)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Listen error: %v", err)
+			errCh <- err
 		}
 	}()
 
+	// 7. [QUAN TRỌNG] Init TCP Server (Pomai Binary Protocol)
+	pomaiSrv := tcpAdapter.NewPomaiServer(tm)
 	go func() {
-		ticker := time.NewTicker(time.Duration(*cleanupFlag) * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				// Duyệt qua tất cả tenant và xóa các key hết hạn
-				for _, uid := range tenants.ListTenants() {
-					tenants.GetStore(uid).CleanupExpired()
-				}
+		log.Printf("Pomai Binary Data Server starting on :%s", tcpPort)
+		if err := pomaiSrv.ListenAndServe(":" + tcpPort); err != nil {
+			// TCP lỗi là lỗi critical, cho sập luôn để restart
+			errCh <- fmt.Errorf("TCP Server failed: %w", err)
+		}
+	}()
+
+	// 8. Graceful Shutdown Handler
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigCh:
+		log.Printf("Signal received: %v, starting graceful shutdown...", sig)
+	case err := <-errCh:
+		log.Fatalf("Server crash: %v", err)
+	}
+
+	// Shutdown HTTP
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer shutdownCancel()
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP shutdown error: %v", err)
+	}
+
+	// Stop Write-Behind
+	if err := wb.Close(); err != nil {
+		log.Printf("Write-behind close error: %v", err)
+	}
+
+	// Snapshot khi tắt (Nếu persistence hỗ trợ Snapshot)
+	if sp, ok := persImpl.(ports.Snapshotter); ok {
+		tenantIDs := tm.ListTenants()
+		log.Printf("Snapshotting %d tenants before exit...", len(tenantIDs))
+		for _, id := range tenantIDs {
+			store := tm.GetStore(id)
+			if err := sp.Snapshot(store); err != nil {
+				log.Printf("Snapshot error tenant=%s: %v", id, err)
 			}
 		}
-	}()
-
-	// ============================================================
-	// 7. Graceful Shutdown
-	// ============================================================
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	log.Println("Shutting down...")
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Duration(*gracefulFlag)*time.Second)
-	defer shutdownCancel()
-
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Shutdown error: %v", err)
+		log.Println("Snapshot complete")
 	}
 
-	log.Println("Bye!")
-}
-
-// Helper Functions
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
+	// Close Persister (File/WAL)
+	if pers != nil {
+		if err := pers.Close(); err != nil {
+			log.Printf("Persister close error: %v", err)
+		}
 	}
-	return defaultValue
-}
 
-func atoiDefault(s string, defaultValue int) int {
-	if v, err := strconv.Atoi(s); err == nil {
-		return v
-	}
-	return defaultValue
-}
-
-func atoi64Default(s string, defaultValue int64) int64 {
-	if v, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return v
-	}
-	return defaultValue
+	log.Println("Shutdown complete. Bye!")
 }
