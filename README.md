@@ -1,9 +1,3 @@
-Dưới đây là bản **README.md** chuyên nghiệp, đầy đủ và "ngầu" dành cho dự án Pomai Cache của bạn. Nó được viết theo phong cách của các dự án Open Source lớn (như Redis, Etcd) để bạn có thể tự tin đẩy lên GitHub.
-
-Bạn hãy tạo file `README.md` ở thư mục gốc và dán nội dung này vào.
-
----
-
 # Pomai Cache
 
 > **High-Performance, Distributed In-Memory Cache written in Go.**
