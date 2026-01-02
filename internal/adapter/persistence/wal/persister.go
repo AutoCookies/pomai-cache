@@ -141,7 +141,7 @@ func (w *WALPersister) Snapshot(target WalTarget) error {
 }
 
 // [SỬA] Thay *engine.Store bằng WalTarget
-func (w *WALPersister) Restore(target WalTarget) error {
+func (w *WALPersister) RestoreFrom(target WalTarget) error {
 	// 1. Restore from snapshot first
 	snapshotPath := w.walPath + ".snapshot"
 	if _, err := os.Stat(snapshotPath); err == nil {
