@@ -26,3 +26,5 @@ testdata/
 tmp/
 *. log
 data/
+cpu.prof
+coverage.out

@@ -1,201 +1,191 @@
 # Pomai Cache
 
-> **High-Performance, Distributed In-Memory Cache written in Go.**
+Pomai Cache is a high-performance in-memory caching engine designed for modern application needs. It combines traditional key-value caching with advanced primitives such as vector (embedding) indexes (HNSW), a knowledge graph cache, probabilistic data structures, and adaptive eviction. Pomai is built to support AI/semantic workloads, real-time analytics, and graph-driven applications while providing low latency and high throughput.
 
-**Pomai Cache** is a robust, concurrent, and persistent key-value store designed for low latency and high throughput. It features a custom binary protocol for maximum performance, smart eviction policies (TinyLFU), and a dual-plane architecture (TCP for data, HTTP for observability).
-
----
+This README gives an overview of the system, the main data types it supports, and how to build and run Pomai and the benchmark tools.
 
 ## Key Features
 
-* **High Performance:**
-* **Sharded Architecture:** Minimizes lock contention using 256+ concurrent shards.
-* **Custom Binary Protocol:** Zero-allocation parsing with a fixed 8-byte header (Port `9090`).
-* **Bloom Filters:** Prevents cache penetration by filtering out non-existent keys before accessing memory.
+- Core key-value cache with TTL support and multiple shard implementations (lock-free adapters).
+- Vector/embedding index using HNSW for fast approximate nearest neighbor search (ANN).
+- Knowledge Graph cache with nodes, typed edges, shortest-path queries, PageRank, community detection and subgraph extraction.
+- Bloom filter integration for fast negative lookups and incremental rebuilds.
+- Eviction manager with multiple modes (standard eviction, hard-override / overwrite tail entries).
+- Probabilistic structures (Bloom filters, sketches) and frequency estimation for TinyLFU-like admission.
+- Bench tool for workload simulation: key-value, AI semantic (vector), and graph workloads.
+- Thread-safe, low-latency design with options to tune efSearch (HNSW), shard counts and capacity.
 
+## Components and Data Types
 
-* **Smart Eviction (TinyLFU):**
-* Uses **Count-Min Sketch** to track frequency efficiently.
-* Admits only "hot" items when full, protecting the cache from one-hit wonders.
+Pomai supports and extends common caching primitives:
 
+- Key-Value
+  - Plain binary values with optional TTL
+  - Fast get/put/delete, multi-get/multi-set
+  - Zero-copy options in internal Entry objects
 
-* **Persistence & Durability:**
-* **WAL (Write-Ahead Log):** Ensures data integrity even after a crash.
-* **Snapshots:** Periodic background snapshots for faster recovery.
+- Vector / Embeddings
+  - HNSW-based ANN index with SIMD-optimized distance functions
+  - Create named indices, insert vectors, search (KNN), delete vectors
+  - Adaptive `efSearch` tuning for recall / latency trade-offs
+  - API: `PutWithEmbedding`, `SemanticSearch`, `CreateVectorIndex`, `InsertVector`
 
+- Knowledge Graph
+  - Add nodes with properties, add typed edges with weights and properties
+  - Neighbor traversal with depth and edge-type filtering
+  - Shortest path (Dijkstra), PageRank, community detection (Louvain or label propagation)
+  - Subgraph extraction and graph statistics
 
-* **Observability:**
-* Dedicated **HTTP Admin API** (Port `8080`).
-* **Prometheus Metrics** endpoint (`/metrics`) built-in.
-* JSON Stats API (`/v1/stats`).
+- Probabilistic Data Structures
+  - Bloom filters (with counting/scalable variants in roadmap)
+  - Sketch data structures for frequency estimation and TinyLFU-style admission
 
+- Eviction & Memory Control
+  - Background eviction worker and on-demand eviction manager
+  - Hard max override mode (overwrite LRU tail entries)
+  - Memory controller hooks to integrate with quota/reservation systems
 
-* **Production Ready:**
-* Fully containerized with Docker & Docker Compose.
-* Graceful Shutdown & Signal Handling.
-* Environment-based configuration.
+## Project Layout (high level)
 
+- `internal/engine/core` — core store, shards, entry metadata, eviction integration, TTL cleaner
+- `internal/engine/ttl` — TTL management and cleanup (including bloom rebuilding)
+- `internal/engine/eviction` — eviction manager, heuristics, metrics
+- `internal/engine/core/vector_store.go` and `packages/ds/vector` — vector index (HNSW) and distance SIMD implementations
+- `packages/ds/graph` — knowledge graph engine
+- `cmd/pomai-bench` — benchmark tool with `--ai-mode` and `--graph-mode`
+- `internal/adapter/tcp` — client/server adapter used by bench tool (client example)
 
+## Build
 
----
-
-## Architecture
-
-Pomai Cache adopts a **Dual-Protocol** design:
-
-| Protocol | Port | Description |
-| --- | --- | --- |
-| **TCP Binary** | `9090` | **Data Plane.** Ultra-fast `SET`, `GET`, `DEL` operations. Used by application clients. |
-| **HTTP/REST** | `8080` | **Control Plane.** Health checks, Statistics, Prometheus Metrics. Used by DevOps/Sysadmins. |
-
----
-
-## Getting Started
-
-### Method 1: Docker (Recommended)
-
-The easiest way to run Pomai Cache is via Docker.
-
-```bash
-# Build the image
-docker build -t pomai-cache:latest .
-
-# Run the container
-docker run -d \
-  --name pomai \
-  -p 9090:9090 \
-  -p 8080:8080 \
-  -v pomai_data:/root/data \
-  -e PER_TENANT_CAPACITY_BYTES=536870912 \
-  pomai-cache:latest
-
-```
-
-### Method 2: Docker Compose (With Monitoring)
-
-Spin up a full stack with **Grafana** and **Prometheus**.
+You need Go 1.20+ (or later). From project root:
 
 ```bash
-docker-compose up -d
+# Build the benchmark tool
+cd cmd/pomai-bench
+go build -o ../../bin/pomai-bench
 
+# (Optional) Build a server binary if present under cmd (name may vary)
+# go build -o ../../bin/pomai-server ./cmd/pomai-server
 ```
 
-* **Pomai Cache:** `localhost:9090` (TCP), `localhost:8080` (HTTP)
-* **Prometheus:** `localhost:9091`
-* **Grafana:** `localhost:3000` (Login: `admin`/`admin`)
+Adjust package paths if your repo layout differs. The repository includes an in-repo HNSW implementation; an alternative is to use an external HNSW library if preferred.
 
-### Method 3: Build from Source
+## Run
+
+### Running the server
+If a server implementation is available in `cmd`, build and run it:
 
 ```bash
-# Clone the repo
-git clone https://github.com/your-username/pomai-cache.git
-cd pomai-cache
-
-# Build binary
-go build -o pomai-server ./cmd/server/main.go
-
-# Run
-./pomai-server
-
+# Example (replace with actual server cmd if different)
+./bin/pomai-server --addr=0.0.0.0:7600 --shards=256 --capacity-bytes=1073741824
 ```
 
----
+Server flags (examples)
+- `--addr` server bind address
+- `--shards` number of shards
+- `--capacity-bytes` total cache capacity
 
-## Configuration
+(See server main for all flags supported in your build.)
 
-Pomai Cache is configured via Environment Variables (`.env` supported).
+### Running the benchmark tool
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `TCP_PORT` | `9090` | Port for Binary Data Protocol. |
-| `PORT` | `8080` | Port for HTTP Admin API. |
-| `DATA_DIR` | `./data` | Directory to store WAL and Snapshots. |
-| `CACHE_SHARDS` | `256` | Number of shards (higher = better concurrency). |
-| `PER_TENANT_CAPACITY_BYTES` | `0` | Max memory per tenant (0 = Unlimited). |
-| `PERSISTENCE_TYPE` | `noop` | `file` (Snapshot only), `wal` (WAL + Snapshot), or `noop`. |
-| `WRITE_BUFFER_SIZE` | `1000` | Write-behind buffer size. |
+The benchmark tool supports multiple modes: standard key-value, AI semantic (vector embedding), and graph workloads.
 
----
+Build and run:
 
-## Client Usage
+```bash
+./bin/pomai-bench --addr=localhost:7600 --clients=50 --requests=1000000
+```
 
-Pomai Cache uses a custom binary protocol. Here is a simple Go client example:
+AI semantic workload:
+
+```bash
+./bin/pomai-bench \
+  --addr=localhost:7600 \
+  --clients=50 \
+  --requests=1000000 \
+  --ai-mode \
+  --vector-dim=128 \
+  --semantic-noise=0.1
+```
+
+Graph workload:
+
+```bash
+./bin/pomai-bench \
+  --addr=localhost:7600 \
+  --clients=50 \
+  --requests=1000000 \
+  --graph-mode \
+  --graph-nodes=10000 \
+  --graph-degree=10
+```
+
+Key bench flags:
+- `--clients` number of concurrent clients
+- `--requests` total requests to issue
+- `--pipeline` pipeline batch size
+- `--ai-mode` enable vector workload (embeddings)
+- `--vector-dim` vector dimension for AI mode
+- `--graph-mode` run graph workload
+- `--graph-nodes`, `--graph-degree` control graph size/topology
+
+## Example Usage (Go API)
+
+The store API exposes functions for vectors and graph operations.
+
+Vector example:
 
 ```go
-package main
-
-import (
-	"fmt"
-	"log"
-	"github.com/your-username/pomai-cache/packages/client"
-)
-
-func main() {
-	// Connect to Pomai Cache
-	cli := client.NewClient("localhost:9090")
-
-	// SET a value
-	err := cli.Set("user:100", []byte("Hello Pomai"))
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// GET a value
-	val, err := cli.Get("user:100")
-	if err != nil {
-		log.Fatal(err)
-	}
-	
-	fmt.Printf("Got value: %s\n", string(val))
-}
-
+store := core.NewStore(256)
+store.CreateVectorIndex("emb", 128, "cosine")
+embedding := make([]float32, 128)
+// fill embedding...
+store.PutWithEmbedding("doc:1", []byte("document1"), embedding, 0)
+results, err := store.SemanticSearch(embedding, 10)
 ```
 
-### Binary Protocol Specification
+Graph example:
 
-Each packet consists of an 8-byte header followed by the payload.
-
-```text
-| Magic (1B) | Opcode (1B) | KeyLen (2B) | ValLen (4B) | ... Payload ... |
-|     'P'    |  1=SET...   |   uint16    |   uint32    | KeyBytes | ValueBytes |
+```go
+store := core.NewStore(256)
+store.CreateGraph("social")
+store.AddGraphNode("social", "alice", map[string]interface{}{"name":"Alice"})
+store.AddGraphNode("social", "bob", map[string]interface{}{"name":"Bob"})
+store.AddGraphEdge("social", "alice", "bob", "friend", 1.0, nil)
+path, err := store.GraphShortestPath("social", "alice", "bob", 6)
+neighbors, _ := store.GraphNeighbors("social", "alice", 2, "friend")
+ranks, _ := store.GraphPageRank("social", 20)
 ```
 
----
+## Configuration and Tuning
 
-## Benchmarks
+- Shard count: choose based on CPU cores to reduce contention.
+- HNSW parameters:
+  - `M` (connections per node) and `efConstruction` impact index quality and build time.
+  - `efSearch` controls recall vs latency at query time. It is tunable at runtime and can be auto-tuned.
+- Bloom filter: can be enabled to speed up negative lookups; rebuilds are triggered by TTL cleanup or manual operations.
+- Eviction policies: the engine supports adaptive eviction; "hard max override" lets you overwrite tail entries under pressure.
 
-Benchmark ran on a standard laptop (Intel i5-4310U, 2 Cores):
+## Operational Notes
 
-| Concurrency | Requests | Duration | Throughput |
-| --- | --- | --- | --- |
-| 1 (Sequential) | 100,000 | 18.6s | ~5,300 req/s |
-| **50 (Concurrent)** | **200,000** | **8.89s** | **~22,500 req/s** |
-
-*> Note: Performance is currently CPU-bound on the test machine. On server-grade hardware with more cores, throughput is expected to scale linearly.*
-
----
-
-## Roadmap
-
-* [x] Core Engine & Sharding
-* [x] TinyLFU Eviction Policy
-* [x] Custom TCP Protocol
-* [x] WAL Persistence
-* [ ] Client Pipelining Support
-* [ ] Distributed Cluster (Raft Consensus)
-
----
+- Memory accounting: store tracks bytes per-shard and global; optional MemoryController hook can be provided for integration with external memory management.
+- TTL cleanup: background cleaner removes expired entries and can trigger incremental bloom rebuilds.
+- Concurrency: core structures use shards, lock-free adapters and atomic counters to maximize throughput.
+- Durability: snapshot/restore APIs are available to serialize/deserialize key-value contents. Graph and vector indices require separate export/import if necessary.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-1. Fork the Project
-2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the Branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+Contributions are welcome. Please follow the repository's coding standards:
+- Add unit tests for new functionality.
+- Document public API changes.
+- Keep performance-sensitive code free of unnecessary allocations.
+- Discuss large design changes in issues before implementing.
 
 ## License
 
-Distributed under the MIT License. See `LICENSE` for more information.
+Specify your project license here (e.g., MIT, Apache 2.0). Add a LICENSE file to the repository.
+
+## Contact
+
+For questions or collaboration, open an issue or contact the maintainers in the repository.

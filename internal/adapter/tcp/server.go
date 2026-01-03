@@ -1,4 +1,3 @@
-// File: internal/adapter/tcp/server.go
 package tcp
 
 import (
@@ -11,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/goccy/go-json"
 
 	"github.com/panjf2000/gnet/v2"
 
@@ -78,6 +79,8 @@ type PomaiServer struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	mu     sync.Mutex
+
+	timestreams sync.Map // tenantID -> *core.TimeStreamStore
 }
 
 type connCtx struct {
@@ -270,6 +273,46 @@ func (s *PomaiServer) handlePacketFast(
 		s.handleMGetFast(c, store, value)
 	case OpMSet:
 		s.handleMSetFast(c, store, value)
+	case OpStreamAppend:
+		s.handleStreamAppendFast(c, ctx.tenantID, key, value)
+	case OpStreamRange:
+		s.handleStreamRangeFast(c, ctx.tenantID, key, value)
+	case OpStreamWindow:
+		s.handleStreamWindowFast(c, ctx.tenantID, key, value)
+	case OpStreamAnomaly:
+		s.handleStreamAnomalyFast(c, ctx.tenantID, key, value)
+	case OpStreamForecast:
+		s.handleStreamForecastFast(c, ctx.tenantID, key, value)
+	case OpStreamPattern:
+		s.handleStreamPatternFast(c, ctx.tenantID, key, value)
+	case OpVectorPut:
+		s.handleVectorPutFast(c, store, key, value)
+	case OpVectorSearch:
+		s.handleVectorSearchFast(c, store, value)
+	case OpBitSet:
+		s.handleBitSetFast(c, store, key, value)
+	case OpBitGet:
+		s.handleBitGetFast(c, store, key, value)
+	case OpBitCount:
+		s.handleBitCountFast(c, store, key, value)
+	case OpStreamReadGroup:
+		s.handleStreamReadGroupFast(c, ctx.tenantID, value)
+	case OpCDCEnable:
+		s.handleCDCEnableFast(c, store, value)
+	case OpCDCGet:
+		s.handleCDCGetFast(c, store, value)
+	case OpZAdd:
+		s.handleZAddFast(c, store, key, value)
+	case OpZRem:
+		s.handleZRemFast(c, store, key, value)
+	case OpZScore:
+		s.handleZScoreFast(c, store, key, value)
+	case OpZRank:
+		s.handleZRankFast(c, store, key, value)
+	case OpZRange:
+		s.handleZRangeFast(c, store, key, value)
+	case OpZCard:
+		s.handleZCardFast(c, store, key)
 	default:
 		s.sendError(c, StatusInvalidRequest, "unknown command")
 	}
@@ -379,6 +422,235 @@ func (s *PomaiServer) handleMSetFast(c gnet.Conn, store *core.Store, data []byte
 	s.sendResponse(c, StatusOK, nil)
 }
 
+func (s *PomaiServer) getTimeStore(tenantID string) *core.TimeStreamStore {
+	v, ok := s.timestreams.Load(tenantID)
+	if ok {
+		return v.(*core.TimeStreamStore)
+	}
+	ts := core.NewTimeStreamStore()
+	actual, _ := s.timestreams.LoadOrStore(tenantID, ts)
+	return actual.(*core.TimeStreamStore)
+}
+
+func (s *PomaiServer) handleStreamAppendFast(c gnet.Conn, tenantID, streamName string, payload []byte) {
+	if streamName == "" {
+		s.sendError(c, StatusInvalidRequest, "empty stream name")
+		return
+	}
+
+	ts := s.getTimeStore(tenantID)
+
+	if len(payload) == 0 {
+		s.sendError(c, StatusInvalidRequest, "empty event payload")
+		return
+	}
+
+	first := payload[0]
+	if first == '[' {
+		var events []*core.Event
+		if err := json.Unmarshal(payload, &events); err != nil {
+			s.sendError(c, StatusInvalidRequest, "invalid batch event payload")
+			return
+		}
+		if len(events) == 0 {
+			s.sendError(c, StatusInvalidRequest, "empty event batch")
+			return
+		}
+		if err := ts.AppendBatch(streamName, events); err != nil {
+			s.sendError(c, StatusServerError, err.Error())
+			return
+		}
+		s.sendResponse(c, StatusOK, nil)
+		return
+	}
+
+	var evt core.Event
+	if err := json.Unmarshal(payload, &evt); err != nil {
+		s.sendError(c, StatusInvalidRequest, "invalid event payload")
+		return
+	}
+
+	if err := ts.Append(streamName, &evt); err != nil {
+		s.sendError(c, StatusServerError, err.Error())
+		return
+	}
+
+	s.sendResponse(c, StatusOK, nil)
+}
+
+func (s *PomaiServer) handleStreamRangeFast(c gnet.Conn, tenantID, streamName string, payload []byte) {
+	if streamName == "" {
+		s.sendError(c, StatusInvalidRequest, "empty stream name")
+		return
+	}
+
+	req := struct {
+		Start int64 `json:"start"`
+		End   int64 `json:"end"`
+	}{}
+	if len(payload) > 0 {
+		if err := json.Unmarshal(payload, &req); err != nil {
+			s.sendError(c, StatusInvalidRequest, "invalid range payload")
+			return
+		}
+	} else {
+		now := time.Now().UnixNano()
+		req.End = now
+		req.Start = now - int64(time.Hour)
+	}
+
+	ts := s.getTimeStore(tenantID)
+	events, err := ts.Range(streamName, req.Start, req.End, nil)
+	if err != nil {
+		s.sendError(c, StatusServerError, err.Error())
+		return
+	}
+
+	response, err := json.Marshal(events)
+	if err != nil {
+		s.sendError(c, StatusServerError, "marshal error")
+		return
+	}
+	s.sendResponse(c, StatusOK, response)
+}
+
+func (s *PomaiServer) handleStreamWindowFast(c gnet.Conn, tenantID, streamName string, payload []byte) {
+	if streamName == "" {
+		s.sendError(c, StatusInvalidRequest, "empty stream name")
+		return
+	}
+
+	req := struct {
+		WindowMs int64  `json:"window_ms"`
+		Agg      string `json:"agg"`
+	}{}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendError(c, StatusInvalidRequest, "invalid window payload")
+		return
+	}
+	if req.WindowMs <= 0 || req.Agg == "" {
+		s.sendError(c, StatusInvalidRequest, "window_ms and agg required")
+		return
+	}
+
+	ts := s.getTimeStore(tenantID)
+	result, err := ts.Window(streamName, time.Duration(req.WindowMs)*time.Millisecond, req.Agg)
+	if err != nil {
+		s.sendError(c, StatusServerError, err.Error())
+		return
+	}
+
+	resp, err := json.Marshal(result)
+	if err != nil {
+		s.sendError(c, StatusServerError, "marshal error")
+		return
+	}
+
+	s.sendResponse(c, StatusOK, resp)
+}
+
+func (s *PomaiServer) handleStreamAnomalyFast(c gnet.Conn, tenantID, streamName string, payload []byte) {
+	if streamName == "" {
+		s.sendError(c, StatusInvalidRequest, "empty stream name")
+		return
+	}
+
+	req := struct {
+		Threshold float64 `json:"threshold"`
+	}{Threshold: 3.0}
+	if len(payload) > 0 {
+		if err := json.Unmarshal(payload, &req); err != nil {
+			s.sendError(c, StatusInvalidRequest, "invalid anomaly payload")
+			return
+		}
+	}
+
+	ts := s.getTimeStore(tenantID)
+	events, err := ts.DetectAnomaly(streamName, req.Threshold)
+	if err != nil {
+		s.sendError(c, StatusServerError, err.Error())
+		return
+	}
+
+	resp, err := json.Marshal(events)
+	if err != nil {
+		s.sendError(c, StatusServerError, "marshal error")
+		return
+	}
+
+	s.sendResponse(c, StatusOK, resp)
+}
+
+func (s *PomaiServer) handleStreamForecastFast(c gnet.Conn, tenantID, streamName string, payload []byte) {
+	if streamName == "" {
+		s.sendError(c, StatusInvalidRequest, "empty stream name")
+		return
+	}
+
+	req := struct {
+		HorizonMs int64 `json:"horizon_ms"`
+	}{HorizonMs: int64(time.Minute.Milliseconds())}
+	if len(payload) > 0 {
+		if err := json.Unmarshal(payload, &req); err != nil {
+			s.sendError(c, StatusInvalidRequest, "invalid forecast payload")
+			return
+		}
+	}
+
+	ts := s.getTimeStore(tenantID)
+	pred, err := ts.Forecast(streamName, time.Duration(req.HorizonMs)*time.Millisecond)
+	if err != nil {
+		s.sendError(c, StatusServerError, err.Error())
+		return
+	}
+
+	resp, err := json.Marshal(map[string]float64{"predicted": pred})
+	if err != nil {
+		s.sendError(c, StatusServerError, "marshal error")
+		return
+	}
+
+	s.sendResponse(c, StatusOK, resp)
+}
+
+func (s *PomaiServer) handleStreamPatternFast(c gnet.Conn, tenantID, streamName string, payload []byte) {
+	if streamName == "" {
+		s.sendError(c, StatusInvalidRequest, "empty stream name")
+		return
+	}
+
+	req := struct {
+		Pattern  []string `json:"pattern"`
+		WithinMs int64    `json:"within_ms"`
+	}{}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendError(c, StatusInvalidRequest, "invalid pattern payload")
+		return
+	}
+	if len(req.Pattern) < 2 {
+		s.sendError(c, StatusInvalidRequest, "pattern must have at least two types")
+		return
+	}
+	if req.WithinMs <= 0 {
+		req.WithinMs = int64(time.Minute.Milliseconds())
+	}
+
+	ts := s.getTimeStore(tenantID)
+	matches, err := ts.DetectPattern(streamName, req.Pattern, time.Duration(req.WithinMs)*time.Millisecond)
+	if err != nil {
+		s.sendError(c, StatusServerError, err.Error())
+		return
+	}
+
+	resp, err := json.Marshal(matches)
+	if err != nil {
+		s.sendError(c, StatusServerError, "marshal error")
+		return
+	}
+
+	s.sendResponse(c, StatusOK, resp)
+}
+
 func (s *PomaiServer) sendResponse(c gnet.Conn, status uint8, value []byte) {
 	keyLen := uint16(0)
 	valLen := uint32(len(value))
@@ -433,7 +705,7 @@ func (s *PomaiServer) OnTick() (time.Duration, gnet.Action) {
 		errorRate = float64(errs) / float64(reqs) * 100
 	}
 
-	log.Printf("[TCP] Conns: %d | Reqs: %d | RPS: %.0f | BW: %.2f MB/s | Errors: %. 2f%%",
+	log.Printf("[TCP] Conns: %d | Reqs: %d | RPS: %.0f | BW: %.2f MB/s | Errors: %.2f%%",
 		conns, reqs, rps, bps, errorRate)
 
 	return 30 * time.Second, gnet.None
@@ -627,4 +899,286 @@ func parseMSetRequestFast(data []byte) (map[string][]byte, error) {
 	}
 
 	return items, nil
+}
+
+func (s *PomaiServer) handleVectorPutFast(c gnet.Conn, store *core.Store, key string, payload []byte) {
+	if key == "" {
+		s.sendError(c, StatusInvalidRequest, "empty key")
+		return
+	}
+
+	var req struct {
+		Data   []byte    `json:"data"`
+		Vector []float32 `json:"vector"`
+		TTL    string    `json:"ttl"`
+	}
+
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendError(c, StatusInvalidRequest, "invalid json payload")
+		return
+	}
+
+	if len(req.Vector) == 0 {
+		s.sendError(c, StatusInvalidRequest, "empty vector")
+		return
+	}
+
+	var ttl time.Duration
+	if req.TTL != "" {
+		var err error
+		ttl, err = time.ParseDuration(req.TTL)
+		if err != nil {
+			s.sendError(c, StatusInvalidRequest, "invalid ttl format")
+			return
+		}
+	}
+
+	if err := store.PutWithEmbedding(key, req.Data, req.Vector, ttl); err != nil {
+		s.sendError(c, StatusServerError, err.Error())
+		return
+	}
+
+	s.sendResponse(c, StatusOK, nil)
+}
+
+func (s *PomaiServer) handleVectorSearchFast(c gnet.Conn, store *core.Store, payload []byte) {
+	var req struct {
+		Vector []float32 `json:"vector"`
+		K      int       `json:"k"`
+	}
+
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendError(c, StatusInvalidRequest, "invalid json payload")
+		return
+	}
+
+	if req.K <= 0 {
+		req.K = 5
+	}
+
+	results, err := store.SemanticSearch(req.Vector, req.K)
+	if err != nil {
+		s.sendError(c, StatusServerError, err.Error())
+		return
+	}
+
+	respData, err := json.Marshal(results)
+	if err != nil {
+		s.sendError(c, StatusServerError, "marshal error")
+		return
+	}
+
+	s.sendResponse(c, StatusOK, respData)
+}
+
+func (s *PomaiServer) handleBitSetFast(c gnet.Conn, store *core.Store, key string, payload []byte) {
+	if key == "" {
+		s.sendError(c, StatusInvalidRequest, "empty key")
+		return
+	}
+
+	var req struct {
+		Offset uint64 `json:"offset"`
+		Value  int    `json:"value"`
+	}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendError(c, StatusInvalidRequest, "invalid json")
+		return
+	}
+
+	orig, err := store.SetBit(key, req.Offset, req.Value)
+	if err != nil {
+		s.sendError(c, StatusServerError, err.Error())
+		return
+	}
+
+	s.sendResponse(c, StatusOK, []byte(strconv.Itoa(orig)))
+}
+
+func (s *PomaiServer) handleBitGetFast(c gnet.Conn, store *core.Store, key string, payload []byte) {
+	if key == "" {
+		s.sendError(c, StatusInvalidRequest, "empty key")
+		return
+	}
+
+	var req struct {
+		Offset uint64 `json:"offset"`
+	}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendError(c, StatusInvalidRequest, "invalid json")
+		return
+	}
+
+	val, err := store.GetBit(key, req.Offset)
+	if err != nil {
+		s.sendError(c, StatusServerError, err.Error())
+		return
+	}
+
+	s.sendResponse(c, StatusOK, []byte(strconv.Itoa(val)))
+}
+
+func (s *PomaiServer) handleBitCountFast(c gnet.Conn, store *core.Store, key string, payload []byte) {
+	if key == "" {
+		s.sendError(c, StatusInvalidRequest, "empty key")
+		return
+	}
+
+	start := int64(0)
+	end := int64(-1)
+
+	if len(payload) > 0 {
+		var req struct {
+			Start int64 `json:"start"`
+			End   int64 `json:"end"`
+		}
+		if err := json.Unmarshal(payload, &req); err == nil {
+			start = req.Start
+			end = req.End
+		}
+	}
+
+	count, err := store.BitCount(key, start, end)
+	if err != nil {
+		s.sendError(c, StatusServerError, err.Error())
+		return
+	}
+
+	s.sendResponse(c, StatusOK, []byte(strconv.FormatInt(count, 10)))
+}
+
+func (s *PomaiServer) handleStreamReadGroupFast(c gnet.Conn, tenantID string, payload []byte) {
+	var req struct {
+		Stream string `json:"stream"`
+		Group  string `json:"group"`
+		Count  int    `json:"count"`
+	}
+
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendError(c, StatusInvalidRequest, "invalid json payload")
+		return
+	}
+
+	if req.Stream == "" || req.Group == "" {
+		s.sendError(c, StatusInvalidRequest, "stream and group are required")
+		return
+	}
+
+	if req.Count <= 0 {
+		req.Count = 10
+	}
+
+	ts := s.getTimeStore(tenantID)
+
+	events, err := ts.ReadGroup(req.Stream, req.Group, req.Count)
+	if err != nil {
+		s.sendError(c, StatusServerError, err.Error())
+		return
+	}
+
+	resp, err := json.Marshal(events)
+	if err != nil {
+		s.sendError(c, StatusServerError, "marshal error")
+		return
+	}
+
+	s.sendResponse(c, StatusOK, resp)
+}
+
+func (s *PomaiServer) handleCDCEnableFast(c gnet.Conn, store *core.Store, payload []byte) {
+	val := string(payload)
+	enabled := val == "1" || val == "true"
+
+	store.EnableCDC(enabled)
+	s.sendResponse(c, StatusOK, []byte("OK"))
+}
+
+func (s *PomaiServer) handleCDCGetFast(c gnet.Conn, store *core.Store, payload []byte) {
+	group := string(payload)
+	if group == "" {
+		group = "default_cdc_reader"
+	}
+
+	events, err := store.GetChanges(group, 100)
+	if err != nil {
+		s.sendError(c, StatusServerError, err.Error())
+		return
+	}
+
+	resp, err := json.Marshal(events)
+	if err != nil {
+		s.sendError(c, StatusServerError, "marshal error")
+		return
+	}
+
+	s.sendResponse(c, StatusOK, resp)
+}
+
+func (s *PomaiServer) handleZAddFast(c gnet.Conn, store *core.Store, key string, payload []byte) {
+	if key == "" {
+		s.sendError(c, StatusInvalidRequest, "empty key")
+		return
+	}
+
+	var req struct {
+		Score  float64 `json:"score"`
+		Member string  `json:"member"`
+	}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendError(c, StatusInvalidRequest, "invalid json")
+		return
+	}
+
+	store.ZAdd(key, req.Score, req.Member)
+	s.sendResponse(c, StatusOK, []byte("OK"))
+}
+
+func (s *PomaiServer) handleZRemFast(c gnet.Conn, store *core.Store, key string, payload []byte) {
+	member := string(payload)
+	removed := store.ZRem(key, member)
+	if removed {
+		s.sendResponse(c, StatusOK, []byte("1"))
+	} else {
+		s.sendResponse(c, StatusOK, []byte("0"))
+	}
+}
+
+func (s *PomaiServer) handleZScoreFast(c gnet.Conn, store *core.Store, key string, payload []byte) {
+	member := string(payload)
+	score, ok := store.ZScore(key, member)
+	if !ok {
+		s.sendResponse(c, StatusKeyNotFound, nil)
+		return
+	}
+	s.sendResponse(c, StatusOK, []byte(fmt.Sprintf("%f", score)))
+}
+
+func (s *PomaiServer) handleZRankFast(c gnet.Conn, store *core.Store, key string, payload []byte) {
+	member := string(payload)
+	rank := store.ZRank(key, member)
+	if rank == -1 {
+		s.sendResponse(c, StatusKeyNotFound, nil)
+		return
+	}
+	s.sendResponse(c, StatusOK, []byte(strconv.Itoa(rank)))
+}
+
+func (s *PomaiServer) handleZRangeFast(c gnet.Conn, store *core.Store, key string, payload []byte) {
+	var req struct {
+		Start int `json:"start"`
+		Stop  int `json:"stop"`
+	}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		s.sendError(c, StatusInvalidRequest, "invalid json")
+		return
+	}
+
+	items := store.ZRange(key, req.Start, req.Stop)
+	resp, _ := json.Marshal(items)
+	s.sendResponse(c, StatusOK, resp)
+}
+
+func (s *PomaiServer) handleZCardFast(c gnet.Conn, store *core.Store, key string) {
+	count := store.ZCard(key)
+	s.sendResponse(c, StatusOK, []byte(strconv.Itoa(count)))
 }

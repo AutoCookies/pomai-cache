@@ -1,4 +1,3 @@
-// File: cmd/server/main.go
 package main
 
 import (
@@ -23,12 +22,13 @@ import (
 	"github.com/AutoCookies/pomai-cache/internal/adapter/persistence/wal"
 	tcpAdapter "github.com/AutoCookies/pomai-cache/internal/adapter/tcp"
 	"github.com/AutoCookies/pomai-cache/internal/core/ports"
+	"github.com/AutoCookies/pomai-cache/internal/engine/core"
 	"github.com/AutoCookies/pomai-cache/internal/engine/tenants"
 )
 
 const (
-	Version     = "1.3.0-gnet"
-	ServiceName = "Pomai Cache (Gnet Edition)"
+	Version     = "1.4.0-ai-stream"
+	ServiceName = "Pomai Cache (Enterprise Edition)"
 )
 
 type Config struct {
@@ -37,6 +37,12 @@ type Config struct {
 
 	CacheShards   int
 	CapacityBytes int64
+
+	MaxVectorCount int64
+	VectorDim      int
+
+	EnableCDC bool
+	CDCStream string
 
 	PersistenceType string
 	DataDir         string
@@ -76,9 +82,15 @@ func main() {
 
 	log.Println("Initializing components...")
 
-	log.Printf("Creating tenant manager (shards=%d, capacity=%s)...",
-		cfg.CacheShards, formatBytes(cfg.CapacityBytes))
-	tm := tenants.NewManager(cfg.CacheShards, cfg.CapacityBytes)
+	storeConfig := &core.StoreConfig{
+		ShardCount:    cfg.CacheShards,
+		CapacityBytes: cfg.CapacityBytes,
+	}
+
+	log.Printf("Creating tenant manager (shards=%d, capacity=%s, ai_ready=%v)...",
+		cfg.CacheShards, formatBytes(cfg.CapacityBytes), cfg.MaxVectorCount > 0)
+
+	tm := tenants.NewManager(storeConfig.ShardCount, storeConfig.CapacityBytes)
 
 	pers, persImpl := setupPersistence(cfg, tm)
 	defer closePersistence(pers, persImpl, tm)
@@ -92,8 +104,7 @@ func main() {
 
 	log.Println("")
 	log.Println("========================================")
-	log.Println("All services ready!")
-	log.Println("Pomai Cache is running!")
+	log.Println("Pomai Cache is READY for High Performance!")
 	log.Println("========================================")
 	log.Println("")
 
@@ -107,9 +118,7 @@ func main() {
 func applyRuntimeTuning() {
 	numCPU := runtime.NumCPU()
 	runtime.GOMAXPROCS(numCPU)
-
 	debug.SetGCPercent(-1)
-
 	debug.SetMemoryLimit(math.MaxInt64)
 }
 
@@ -119,11 +128,9 @@ func applyConfigTuning(cfg *Config) {
 		log.Printf("GOMAXPROCS set to %d", cfg.MaxProcs)
 	}
 
-	if cfg.GCPercent >= 0 {
+	if cfg.GCPercent >= -1 {
 		old := debug.SetGCPercent(cfg.GCPercent)
 		log.Printf("GC percent changed from %d to %d", old, cfg.GCPercent)
-	} else {
-		log.Println("Go GC disabled")
 	}
 
 	if cfg.MemoryLimit > 0 {
@@ -145,6 +152,10 @@ func loadConfig() (*Config, error) {
 
 		CacheShards:   getenvInt("CACHE_SHARDS", 2048),
 		CapacityBytes: int64(getenvInt("PER_TENANT_CAPACITY_BYTES", 0)),
+
+		MaxVectorCount: int64(getenvInt("MAX_VECTOR_COUNT", 500000)),
+		EnableCDC:      getenvBool("ENABLE_CDC", false),
+		CDCStream:      getenv("CDC_STREAM_NAME", "__cdc_log__"),
 
 		PersistenceType: getenv("PERSISTENCE_TYPE", "none"),
 		DataDir:         getenv("DATA_DIR", "./data"),
@@ -181,67 +192,51 @@ func validateConfig(cfg *Config) error {
 	if cfg.CacheShards < 1 || cfg.CacheShards > 8192 {
 		return fmt.Errorf("CACHE_SHARDS must be 1-8192, got %d", cfg.CacheShards)
 	}
-
 	if cfg.CapacityBytes < 0 {
 		return fmt.Errorf("capacity cannot be negative")
 	}
-
-	if cfg.WriteBufferSize < 1 {
-		return fmt.Errorf("write buffer size must be >= 1")
+	if cfg.MaxVectorCount < 0 {
+		return fmt.Errorf("MAX_VECTOR_COUNT cannot be negative")
 	}
-
-	validPersistence := map[string]bool{
-		"wal":  true,
-		"file": true,
-		"none": true,
-	}
-
-	if !validPersistence[cfg.PersistenceType] {
-		return fmt.Errorf("invalid persistence type: %s", cfg.PersistenceType)
-	}
-
-	if cfg.GCPercent < -1 {
-		return fmt.Errorf("GOGC must be >= -1, got %d", cfg.GCPercent)
-	}
-
 	return nil
 }
 
 func printBanner(cfg *Config) {
 	banner := `
-========================================
+==================================================
    POMAI CACHE v%s
-========================================
-  High Performance In-Memory Cache
-    Powered by Gnet Event-Driven I/O
-========================================
+==================================================
+  Unified Multi-Model In-Memory Database
+  (KV + Graph + Vector + TimeSeries + Stream)
+==================================================
 
-System: 
-  Go:               %s
-  CPU:            %d cores
-  GOMAXPROCS:     %d
-  Platform:       %s/%s
-  GC:              Disabled
-  Memory Limit:   %s
+System Resources:
+  Go Version:      %s
+  CPU Cores:       %d
+  GOMAXPROCS:      %d
+  OS/Arch:         %s/%s
+  Memory Limit:    %s
 
-Config:
-  HTTP:            :%s
-  TCP:            :%s (Gnet)
-  Shards:         %d
-  Capacity:       %s
-  Persistence:    %s
+Modules Status:
+  Key-Value:       Enabled (Shards: %d, Cap: %s)
+  Vector AI:       Enabled (Max: %d vectors)
+  TimeStream:      Enabled (CDC: %v)
+  Graph DB:        Enabled
+  Bitmap:          Enabled
 
-Mode:
-  Gnet:           Enabled
-  Auto-Tuning:    Enabled
-  Stats:           Disabled
-  Profiling:      %v
+Networking:
+  HTTP API:        :%s
+  TCP (Gnet):      :%s
 
-Endpoints:
-  Health:          http://localhost:%s/health
-  Stats:          http://localhost:%s/v1/stats
+Persistence:
+  Type:            %s
+  Data Dir:        %s
 
-========================================
+Observability:
+  Stats:           http://localhost:%s/v1/stats
+  Profiling:       %v
+
+==================================================
 `
 
 	capacityStr := "Unlimited"
@@ -262,14 +257,16 @@ Endpoints:
 		runtime.GOOS,
 		runtime.GOARCH,
 		memLimitStr,
-		cfg.HTTPPort,
-		cfg.TCPPort,
 		cfg.CacheShards,
 		capacityStr,
+		cfg.MaxVectorCount,
+		cfg.EnableCDC,
+		cfg.HTTPPort,
+		cfg.TCPPort,
 		cfg.PersistenceType,
+		cfg.DataDir,
+		cfg.HTTPPort,
 		cfg.EnableProfiling,
-		cfg.HTTPPort,
-		cfg.HTTPPort,
 	)
 }
 
@@ -290,7 +287,7 @@ func setupPersistence(cfg *Config, tm *tenants.Manager) (ports.Persister, interf
 		persImpl = fp
 
 	case "wal":
-		walPath := fmt.Sprintf("%s/wal. log", cfg.DataDir)
+		walPath := fmt.Sprintf("%s/wal.log", cfg.DataDir)
 		wp, err := wal.NewWALPersister(walPath)
 		if err != nil {
 			log.Fatalf("Failed to create WAL persister:  %v", err)
@@ -345,7 +342,7 @@ func setupWriteBehind(cfg *Config, pers ports.Persister) *persistence.WriteBehin
 }
 
 func startServers(cfg *Config, tm *tenants.Manager) (*httpAdapter.Server, *tcpAdapter.PomaiServer) {
-	log.Printf("Starting HTTP server on :%s.. .", cfg.HTTPPort)
+	log.Printf("Starting HTTP server on :%s...", cfg.HTTPPort)
 
 	httpConfig := httpAdapter.DefaultServerConfig()
 	httpConfig.Port, _ = strconv.Atoi(cfg.HTTPPort)
@@ -366,7 +363,7 @@ func startServers(cfg *Config, tm *tenants.Manager) (*httpAdapter.Server, *tcpAd
 
 	log.Printf("HTTP server started on :%s", cfg.HTTPPort)
 
-	log.Printf("Starting Gnet TCP server on :%s.. .", cfg.TCPPort)
+	log.Printf("Starting Gnet TCP server on :%s...", cfg.TCPPort)
 
 	tcpSrv := tcpAdapter.NewPomaiServer(tm)
 
@@ -447,7 +444,7 @@ func gracefulShutdown(cfg *Config, httpSrv *httpAdapter.Server, tcpSrv *tcpAdapt
 
 	printFinalStats(tm)
 
-	log.Println("\nShutdown complete.  Goodbye!")
+	log.Println("\nShutdown complete. Goodbye!")
 }
 
 func closeWriteBehind(wb *persistence.WriteBehindBuffer) {
@@ -487,7 +484,7 @@ func createSnapshots(sp ports.Snapshotter, tm *tenants.Manager) {
 		}
 	}
 
-	log.Printf("Snapshots created: %d/%d (items:  %d, size: %s)",
+	log.Printf("Snapshots created: %d/%d (items: %d, size: %s)",
 		successCount, len(tenantIDs), totalItems, formatBytes(totalBytes))
 }
 

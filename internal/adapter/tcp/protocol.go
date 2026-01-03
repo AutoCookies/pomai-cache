@@ -28,6 +28,30 @@ const (
 	OpMSet   = 6
 	OpExists = 7
 	OpStats  = 8
+
+	OpStreamAppend    = 20
+	OpStreamRange     = 21
+	OpStreamWindow    = 22
+	OpStreamAnomaly   = 23
+	OpStreamForecast  = 24
+	OpStreamPattern   = 25
+	OpStreamReadGroup = 26
+	OpCDCEnable       = 27
+	OpCDCGet          = 28
+
+	OpVectorPut    = 30
+	OpVectorSearch = 31
+
+	OpBitSet   = 40
+	OpBitGet   = 41
+	OpBitCount = 42
+
+	OpZAdd   = 50
+	OpZRem   = 51
+	OpZScore = 52
+	OpZRank  = 53
+	OpZRange = 54
+	OpZCard  = 55
 )
 
 // Status codes

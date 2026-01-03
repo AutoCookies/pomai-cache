@@ -1,4 +1,3 @@
-// File: packages/ds/skiplist/skiplist.go
 package skiplist
 
 import (
@@ -7,258 +6,225 @@ import (
 	"time"
 )
 
-const maxLevel = 32
-const probability = 0.25
+const (
+	maxLevel = 32
+	p        = 0.25
+)
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
+type Element struct {
+	Member string  `json:"member"`
+	Score  float64 `json:"score"`
 }
 
-// NodePublic represents public node data
-type NodePublic struct {
+type Node struct {
 	Member string
 	Score  float64
+	next   []*Node
+	span   []int
 }
 
-// znode represents internal skiplist node
-type znode struct {
-	member string
-	score  float64
-	next   []*znode
-}
-
-// Skiplist implements a thread-safe sorted set
 type Skiplist struct {
-	mu    sync.RWMutex
-	head  *znode
-	level int
-	dict  map[string]*znode
-	size  int64
+	head   *Node
+	level  int
+	length int
+	dict   map[string]float64
+	mu     sync.RWMutex
 }
 
-// New creates new skiplist
 func New() *Skiplist {
 	return &Skiplist{
-		head:  &znode{next: make([]*znode, maxLevel)},
+		head: &Node{
+			next: make([]*Node, maxLevel),
+			span: make([]int, maxLevel),
+		},
 		level: 1,
-		dict:  make(map[string]*znode),
-		size:  0,
+		dict:  make(map[string]float64),
 	}
 }
 
-// Add adds or updates member with score
-func (z *Skiplist) Add(member string, score float64) {
-	z.mu.Lock()
-	defer z.mu.Unlock()
-
-	// Remove existing if present
-	if _, ok := z.dict[member]; ok {
-		z.removeLocked(member)
+func randomLevel() int {
+	level := 1
+	for rand.Float64() < p && level < maxLevel {
+		level++
 	}
+	return level
+}
 
-	// Find insertion point
-	update := make([]*znode, maxLevel)
-	current := z.head
+func (sl *Skiplist) Insert(member string, score float64) {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
 
-	for i := z.level - 1; i >= 0; i-- {
-		for current.next[i] != nil && current.next[i].score < score {
-			current = current.next[i]
+	if curScore, exists := sl.dict[member]; exists {
+		if curScore == score {
+			return
 		}
-		update[i] = current
+		sl.deleteLocked(member, curScore)
 	}
 
-	// Determine level for new node
+	sl.dict[member] = score
+	update := make([]*Node, maxLevel)
+	rank := make([]int, maxLevel)
+	x := sl.head
+
+	for i := sl.level - 1; i >= 0; i-- {
+		if i == sl.level-1 {
+			rank[i] = 0
+		} else {
+			rank[i] = rank[i+1]
+		}
+		for x.next[i] != nil && (x.next[i].Score < score || (x.next[i].Score == score && x.next[i].Member < member)) {
+			rank[i] += x.span[i]
+			x = x.next[i]
+		}
+		update[i] = x
+	}
+
 	lvl := randomLevel()
-	if lvl > z.level {
-		for i := z.level; i < lvl; i++ {
-			update[i] = z.head
+	if lvl > sl.level {
+		for i := sl.level; i < lvl; i++ {
+			rank[i] = 0
+			update[i] = sl.head
+			update[i].span[i] = sl.length
 		}
-		z.level = lvl
+		sl.level = lvl
 	}
 
-	// Create and insert new node
-	newNode := &znode{
-		member: member,
-		score:  score,
-		next:   make([]*znode, lvl),
+	x = &Node{
+		Member: member,
+		Score:  score,
+		next:   make([]*Node, lvl),
+		span:   make([]int, lvl),
 	}
 
 	for i := 0; i < lvl; i++ {
-		newNode.next[i] = update[i].next[i]
-		update[i].next[i] = newNode
+		x.next[i] = update[i].next[i]
+		update[i].next[i] = x
+
+		x.span[i] = update[i].span[i] - (rank[0] - rank[i])
+		update[i].span[i] = (rank[0] - rank[i]) + 1
 	}
 
-	z.dict[member] = newNode
-	z.size++
-}
-
-// Range returns members in rank range [start, stop]
-// Negative stop means all elements
-func (z *Skiplist) Range(start, stop int) []string {
-	z.mu.RLock()
-	defer z.mu.RUnlock()
-
-	result := make([]string, 0, z.size)
-	current := z.head.next[0]
-	rank := 0
-
-	for current != nil {
-		if rank >= start && (stop < 0 || rank <= stop) {
-			result = append(result, current.member)
-		}
-		if stop >= 0 && rank > stop {
-			break
-		}
-		current = current.next[0]
-		rank++
+	for i := lvl; i < sl.level; i++ {
+		update[i].span[i]++
 	}
 
-	return result
+	sl.length++
 }
 
-// Remove removes member and returns true if found
-func (z *Skiplist) Remove(member string) bool {
-	z.mu.Lock()
-	defer z.mu.Unlock()
-	return z.removeLocked(member)
-}
+func (sl *Skiplist) Delete(member string) bool {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
 
-// removeLocked removes member (internal, must hold lock)
-func (z *Skiplist) removeLocked(member string) bool {
-	node, ok := z.dict[member]
-	if !ok {
+	score, exists := sl.dict[member]
+	if !exists {
 		return false
 	}
 
-	// Find update nodes
-	update := make([]*znode, maxLevel)
-	current := z.head
-
-	for i := z.level - 1; i >= 0; i-- {
-		for current.next[i] != nil && current.next[i].score < node.score {
-			current = current.next[i]
-		}
-		update[i] = current
-	}
-
-	// Remove node from all levels
-	for i := 0; i < z.level; i++ {
-		if update[i].next[i] == node {
-			update[i].next[i] = node.next[i]
-		}
-	}
-
-	// Adjust level if needed
-	for z.level > 1 && z.head.next[z.level-1] == nil {
-		z.level--
-	}
-
-	delete(z.dict, member)
-	z.size--
+	sl.deleteLocked(member, score)
+	delete(sl.dict, member)
 	return true
 }
 
-// Score returns score of member
-func (z *Skiplist) Score(member string) (float64, bool) {
-	z.mu.RLock()
-	defer z.mu.RUnlock()
-
-	node, ok := z.dict[member]
-	if !ok {
-		return 0, false
-	}
-	return node.score, true
-}
-
-// Len returns number of members
-func (z *Skiplist) Len() int {
-	z.mu.RLock()
-	defer z.mu.RUnlock()
-	return int(z.size)
-}
-
-// Dump returns all members as public nodes
-func (z *Skiplist) Dump() []NodePublic {
-	z.mu.RLock()
-	defer z.mu.RUnlock()
-
-	result := make([]NodePublic, 0, z.size)
-	current := z.head.next[0]
-
-	for current != nil {
-		result = append(result, NodePublic{
-			Member: current.member,
-			Score:  current.score,
-		})
-		current = current.next[0]
+func (sl *Skiplist) deleteLocked(member string, score float64) {
+	update := make([]*Node, maxLevel)
+	x := sl.head
+	for i := sl.level - 1; i >= 0; i-- {
+		for x.next[i] != nil && (x.next[i].Score < score || (x.next[i].Score == score && x.next[i].Member < member)) {
+			x = x.next[i]
+		}
+		update[i] = x
 	}
 
-	return result
+	x = x.next[0]
+	if x != nil && x.Score == score && x.Member == member {
+		for i := 0; i < sl.level; i++ {
+			if update[i].next[i] == x {
+				update[i].span[i] += x.span[i] - 1
+				update[i].next[i] = x.next[i]
+			} else {
+				update[i].span[i]--
+			}
+		}
+		for sl.level > 1 && sl.head.next[sl.level-1] == nil {
+			sl.level--
+		}
+		sl.length--
+	}
 }
 
-// Size returns number of members (alias for Len)
-func (z *Skiplist) Size() int64 {
-	z.mu.RLock()
-	defer z.mu.RUnlock()
-	return z.size
+func (sl *Skiplist) GetRank(member string) int {
+	sl.mu.RLock()
+	defer sl.mu.RUnlock()
+
+	score, exists := sl.dict[member]
+	if !exists {
+		return -1
+	}
+
+	rank := 0
+	x := sl.head
+	for i := sl.level - 1; i >= 0; i-- {
+		for x.next[i] != nil && (x.next[i].Score < score || (x.next[i].Score == score && x.next[i].Member <= member)) {
+			rank += x.span[i]
+			x = x.next[i]
+		}
+	}
+	return rank - 1
 }
 
-// Get returns score of member (alias for Score)
-func (z *Skiplist) Get(member string) (float64, bool) {
-	return z.Score(member)
-}
+func (sl *Skiplist) GetRange(start, stop int) []Element {
+	sl.mu.RLock()
+	defer sl.mu.RUnlock()
 
-// RangeByScore returns members with scores in [minScore, maxScore]
-func (z *Skiplist) RangeByScore(minScore, maxScore float64, limit int) []NodePublic {
-	z.mu.RLock()
-	defer z.mu.RUnlock()
+	if start < 0 {
+		start = sl.length + start
+	}
+	if stop < 0 {
+		stop = sl.length + stop
+	}
 
-	result := make([]NodePublic, 0)
-	current := z.head
+	if start < 0 {
+		start = 0
+	}
+	if start >= sl.length || start > stop {
+		return nil
+	}
 
-	// Find first node >= minScore
-	for i := z.level - 1; i >= 0; i-- {
-		for current.next[i] != nil && current.next[i].score < minScore {
-			current = current.next[i]
+	x := sl.head
+	accumulated := 0
+	for i := sl.level - 1; i >= 0; i-- {
+		for x.next[i] != nil && accumulated+x.span[i] <= start {
+			accumulated += x.span[i]
+			x = x.next[i]
 		}
 	}
 
-	current = current.next[0]
-	count := 0
+	x = x.next[0]
 
-	// Collect nodes in range
-	for current != nil && current.score <= maxScore {
-		if limit <= 0 || count < limit {
-			result = append(result, NodePublic{
-				Member: current.member,
-				Score:  current.score,
-			})
-			count++
-		} else {
-			break
-		}
-		current = current.next[0]
+	limit := stop - start + 1
+	result := make([]Element, 0, limit)
+
+	for x != nil && limit > 0 {
+		result = append(result, Element{Member: x.Member, Score: x.Score})
+		x = x.next[0]
+		limit--
 	}
-
 	return result
 }
 
-// Clear removes all members
-func (z *Skiplist) Clear() {
-	z.mu.Lock()
-	defer z.mu.Unlock()
-
-	z.head = &znode{next: make([]*znode, maxLevel)}
-	z.level = 1
-	z.dict = make(map[string]*znode)
-	z.size = 0
+func (sl *Skiplist) GetScore(member string) (float64, bool) {
+	sl.mu.RLock()
+	defer sl.mu.RUnlock()
+	val, ok := sl.dict[member]
+	return val, ok
 }
 
-// randomLevel generates random level for new node
-func randomLevel() int {
-	lvl := 1
-	for rand.Float64() < probability && lvl < maxLevel {
-		lvl++
-	}
-	return lvl
+func (sl *Skiplist) Card() int {
+	sl.mu.RLock()
+	defer sl.mu.RUnlock()
+	return sl.length
+}
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
 }
